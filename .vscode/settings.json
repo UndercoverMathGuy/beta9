@@ -11,7 +11,7 @@
         "editor.defaultFormatter": "xaver.clang-format",
         "editor.formatOnSave": true
     },
-    "python.defaultInterpreterPath": "sdk/.venv/bin/python",
+    "python.defaultInterpreterPath": "${workspaceFolder}/sdk/.venv/bin/python",
     "protoc": {
         "path": "protoc",
         "options": [

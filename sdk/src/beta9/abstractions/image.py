@@ -501,6 +501,110 @@ class Image(BaseAbstraction):
             image_id=image_id,
         )
 
+    @classmethod
+    def auto(
+        cls,
+        path: Optional[str] = None,
+        python_version: PythonVersionAlias = PythonVersion.Python3,
+        base_image: Optional[str] = None,
+        base_image_creds: Optional[ImageCredentials] = None,
+        commands: Optional[List[str]] = None,
+    ) -> "Image":
+        """
+        Create an Image by automatically detecting dependencies from source code.
+
+        This method analyzes your project's source code, lockfiles, and manifests to
+        automatically discover and pin Python package dependencies. It uses a multi-phase
+        approach with strict priority ordering:
+
+            1. Lockfiles (uv.lock, poetry.lock, Pipfile.lock) - Fully trusted with pinned versions
+            2. Manifests (pyproject.toml, requirements.txt, etc.) - Trusted for package names
+            3. AST scanning - Discovers imports not declared in manifests
+
+        Parameters:
+            path (Optional[str]):
+                Path to the project root directory. If not provided, defaults to the
+                current working directory. The method will search for the repository
+                root by looking for marker files (pyproject.toml, setup.py, .git, etc.).
+            python_version (PythonVersionAlias):
+                The Python version to use. Default is PythonVersion.Python3.
+            base_image (Optional[str]):
+                Optional base image URI. If not provided, uses the default Beam base image.
+            base_image_creds (Optional[ImageCredentials]):
+                Optional credentials for private base image registry access.
+            commands (Optional[List[str]]):
+                Optional list of shell commands to run during image build.
+
+        Returns:
+            Image: The Image object configured with auto-detected dependencies.
+
+        Example:
+            Basic usage with current directory:
+
+            ```python
+            from beta9 import Image, endpoint
+
+            # Auto-detect all dependencies from current project
+            @endpoint(image=Image.auto())
+            def handler():
+                import requests  # Automatically detected and installed
+                return requests.get("https://api.example.com").json()
+            ```
+
+            Specify a different project path:
+
+            ```python
+            image = Image.auto("./my_project")
+            ```
+
+            Combine with additional configuration:
+
+            ```python
+            image = Image.auto(
+                path="./api",
+                python_version="python3.11",
+                commands=["apt-get update && apt-get install -y ffmpeg"],
+            )
+            ```
+
+        Note:
+            For best results, use a lockfile (uv.lock, poetry.lock, or Pipfile.lock)
+            to ensure reproducible builds with pinned versions. Without a lockfile,
+            versions will be inferred from installed packages or left unpinned.
+        """
+        # Import here to avoid circular imports and keep it optional
+        from .experimental.containerizer import get_pip_packages
+
+        # Default to current working directory
+        project_path = path or os.getcwd()
+
+        # Skip dependency detection in remote environment
+        if env.is_remote():
+            return cls(
+                python_version=python_version,
+                base_image=base_image or "",
+                base_image_creds=base_image_creds,
+                commands=commands or [],
+            )
+
+        # Discover dependencies from source
+        try:
+            packages = get_pip_packages(project_path)
+        except Exception as e:
+            terminal.warn(f"Failed to auto-detect dependencies: {e}")
+            packages = []
+
+        # Create image with detected packages
+        image = cls(
+            python_version=python_version,
+            python_packages=packages,
+            base_image=base_image or "",
+            base_image_creds=base_image_creds,
+            commands=commands or [],
+        )
+
+        return image
+
     def exists(self) -> Tuple[bool, ImageBuildResult]:
         r: VerifyImageBuildResponse = self.stub.verify_image_build(
             VerifyImageBuildRequest(
