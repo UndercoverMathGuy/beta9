@@ -165,6 +165,18 @@ class PricingPolicyCostModel(str, Enum):
     Task = "task"
     Duration = "duration"
 
+@dataclass
+class Batch:
+    """
+    Configuration for dynamic batching on endpoints.
+    Parameters:
+        max_size (int):
+            The maximum number of requests to batch together.
+        wait_ms (int):
+            The maximum amount of time to wait for additional requests before processing the batch.
+    """
+    max_size: int = 1
+    wait_ms: int = 50
 
 @dataclass
 class PricingPolicy:

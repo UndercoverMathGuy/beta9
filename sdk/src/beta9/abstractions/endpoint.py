@@ -29,6 +29,7 @@ from ..env import is_local
 from ..schema import Schema
 from ..type import (
     Autoscaler,
+    Batch,
     GpuType,
     GpuTypeAlias,
     PricingPolicy,
@@ -154,6 +155,7 @@ class Endpoint(RunnerAbstraction):
         pricing: Optional[PricingPolicy] = None,
         inputs: Optional[Schema] = None,
         outputs: Optional[Schema] = None,
+        batch: Optional[Batch] = None,
     ):
         super().__init__(
             cpu=cpu,
@@ -182,6 +184,7 @@ class Endpoint(RunnerAbstraction):
             pricing=pricing,
             inputs=inputs,
             outputs=outputs,
+            batch=batch, 
         )
 
         self._endpoint_stub: Optional[EndpointServiceStub] = None

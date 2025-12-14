@@ -3,6 +3,7 @@ package endpoint
 import (
 	"bytes"
 	"context"
+	stdjson "encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
@@ -105,7 +107,11 @@ func NewRequestBuffer(
 	}
 
 	go rb.discoverContainers()
-	go rb.processRequests()
+	if stubConfig.BatchConfig != nil && stubConfig.BatchConfig.MaxSize > 1 {
+		go rb.processBatchRequests()
+	} else {
+		go rb.processRequests()
+	}
 
 	// Listen for heartbeat key events
 	go rb.keyEventManager.ListenForPattern(rb.ctx, Keys.endpointRequestHeartbeat(rb.workspace.Name, rb.stubId, "*", "*"), rb.keyEventChan)
@@ -186,6 +192,77 @@ func (rb *RequestBuffer) processRequests() {
 			go rb.handleRequest(req)
 		}
 	}
+}
+
+func (rb *RequestBuffer) processBatchRequests() {
+	for {
+		batch := batchBuffer{
+			maxSize: rb.stubConfig.BatchConfig.MaxSize,
+			timeout: time.Duration(rb.stubConfig.BatchConfig.WaitMs) * time.Millisecond,
+		}
+		var timer *time.Timer
+		var timerC <-chan time.Time
+
+		for len(batch.requests) < batch.maxSize {
+			select {
+			case <-rb.ctx.Done():
+				return
+			case <-timerC:
+				goto dispatch
+			default:
+				if len(rb.availableContainers) == 0 {
+					time.Sleep(requestProcessingInterval)
+					continue
+				}
+
+				req, ok := rb.buffer.Pop()
+				if !ok {
+					time.Sleep(requestProcessingInterval)
+					continue
+				}
+
+				if req.ctx.IsWebSocket() {
+					go rb.handleRequest(req)
+					continue
+				}
+
+				if req.ctx.Request().Context().Err() != nil {
+					rb.cancelInFlightTask(req.task, types.TaskRequestCancelled)
+					continue
+				}
+				if rb.isASGI {
+					go rb.handleRequest(req)
+					continue
+				}
+
+				batch.requests = append(batch.requests, req)
+				if len(batch.requests) == 1 {
+					batch.batchId = uuid.New().String()
+					timer = time.NewTimer(batch.timeout)
+					timerC = timer.C
+				}
+			}
+		}
+	dispatch:
+		if timer != nil {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+		if len(batch.requests) > 0 {
+			go rb.handleBatchRequest(&batch)
+		}
+	}
+}
+
+type batchBuffer struct {
+	requests []*request
+	maxSize  int
+	timeout  time.Duration
+	batchId  string
 }
 
 func (rb *RequestBuffer) checkAddressIsReady(address string) bool {
@@ -407,6 +484,37 @@ func (rb *RequestBuffer) handleRequest(req *request) {
 	}
 }
 
+func (rb *RequestBuffer) handleBatchRequest(batch *batchBuffer) {
+	rb.availableContainersLock.RLock()
+
+	if len(rb.availableContainers) == 0 {
+		for _, req := range batch.requests {
+			rb.buffer.Push(req, true)
+		}
+		rb.availableContainersLock.RUnlock()
+		return
+	}
+
+	c := rb.availableContainers[0]
+	rb.availableContainersLock.RUnlock()
+
+	err := rb.acquireRequestToken(c.id)
+	if err != nil {
+		for _, req := range batch.requests {
+			rb.buffer.Push(req, true)
+		}
+		return
+	}
+	defer rb.afterBatchRequest(batch, c.id, batch.batchId)
+	for _, req := range batch.requests {
+		req.processed = true
+	}
+	done := make(chan struct{})
+	go rb.batchHeartBeat(rb.ctx, batch.batchId, c.id, done)
+	rb.handleBatchHttpRequest(batch, c, batch.batchId)
+	close(done)
+}
+
 func (rb *RequestBuffer) handleWSRequest(req *request, c container) {
 	dstDialer := websocket.Dialer{
 		NetDialContext: network.GetDialer(c.address, rb.tailscale, rb.tsConfig),
@@ -537,6 +645,256 @@ func (rb *RequestBuffer) handleHttpRequest(req *request, c container) {
 	}
 }
 
+type batchItem struct {
+	TaskId   string
+	BatchIdx int
+	Payload  *types.TaskPayload
+	Request  *http.Request
+	Error    error
+}
+
+func (rb *RequestBuffer) parseBatchItems(batch batchBuffer) ([]batchItem, error) {
+	items := make([]batchItem, len(batch.requests))
+	for idx, req := range batch.requests {
+		request := req.ctx.Request()
+		item := batchItem{
+			TaskId:   req.task.msg.TaskId,
+			Request:  request,
+			BatchIdx: idx,
+		}
+
+		if !rb.isASGI {
+			payload, err := task.SerializeHttpPayload(req.ctx)
+			if err != nil {
+				// Store error but don't cancel task yet (match handleHttpRequest order: write JSON first, then cancel)
+				item.Error = err
+				items[idx] = item
+				continue
+			}
+			item.Payload = payload
+		}
+
+		items[idx] = item
+	}
+	return items, nil
+}
+
+type batchResultItem struct {
+	BatchIdx   int                `json:"batch_index"`
+	StatusCode int                `json:"status_code"`
+	Body       stdjson.RawMessage `json:"body"`
+	filled     bool
+}
+
+func (rb *RequestBuffer) handleBatchHttpRequest(batch *batchBuffer, c container, batchId string) error {
+	items, _ := rb.parseBatchItems(*batch)
+	batchId = batch.batchId
+	results := make([]batchResultItem, len(batch.requests))
+
+	validItems := make([]map[string]interface{}, 0)
+	for i, item := range items {
+		if item.Error != nil {
+			// Pre-fill error result (will write to client in demux, then cancel task)
+			errBody, _ := json.Marshal(map[string]interface{}{
+				"error": item.Error.Error(),
+			})
+			results[i] = batchResultItem{
+				BatchIdx:   i,
+				StatusCode: http.StatusBadRequest,
+				Body:       errBody,
+				filled:     true,
+			}
+			continue
+		}
+		validItems = append(validItems, map[string]interface{}{
+			"batch_index": item.BatchIdx,
+			"task_id":     item.TaskId,
+			"payload":     item.Payload,
+		})
+	}
+
+	// Only send to container if we have valid items
+	if len(validItems) > 0 {
+		batchPayload := map[string]interface{}{
+			"batch_id": batchId,
+			"items":    validItems,
+		}
+		batchPayloadBytes, err := json.Marshal(batchPayload)
+		if err != nil {
+			// Write 500 to all unfilled results (same as handleHttpRequest line 510)
+			for i := range results {
+				if !results[i].filled {
+					errBody, _ := json.Marshal(map[string]interface{}{"error": "Internal server error"})
+					results[i] = batchResultItem{BatchIdx: i, StatusCode: http.StatusInternalServerError, Body: errBody, filled: true}
+				}
+			}
+			goto demux
+		}
+
+		httpClient, err := rb.getHttpClient(c.address, handleHttpRequestClientTimeout)
+		if err != nil {
+			// Write 500 to all unfilled results (same as handleHttpRequest line 521)
+			for i := range results {
+				if !results[i].filled {
+					errBody, _ := json.Marshal(map[string]interface{}{"error": "Internal server error"})
+					results[i] = batchResultItem{BatchIdx: i, StatusCode: http.StatusInternalServerError, Body: errBody, filled: true}
+				}
+			}
+			goto demux
+		}
+
+		containerUrl := fmt.Sprintf("http://%s/__batch__", c.address)
+
+		ctx, cancel := context.WithTimeout(rb.ctx, handleHttpRequestClientTimeout)
+		defer cancel()
+
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", containerUrl, bytes.NewReader(batchPayloadBytes))
+		if err != nil {
+			// Write 500 to all unfilled results (same as handleHttpRequest line 538)
+			for i := range results {
+				if !results[i].filled {
+					errBody, _ := json.Marshal(map[string]interface{}{"error": "Internal server error"})
+					results[i] = batchResultItem{BatchIdx: i, StatusCode: http.StatusInternalServerError, Body: errBody, filled: true}
+				}
+			}
+			goto demux
+		}
+
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("X-BATCH-ID", batchId)
+
+		// Copy headers from first request (same as handleHttpRequest line 544-548)
+		if len(batch.requests) > 0 {
+			firstReq := batch.requests[0].ctx.Request()
+			for key, values := range firstReq.Header {
+				for _, val := range values {
+					httpReq.Header.Add(key, val)
+				}
+			}
+		}
+
+		resp, err := httpClient.Do(httpReq)
+		if err != nil {
+			// Check if context was cancelled (same as handleHttpRequest line 556)
+			if ctx.Err() == context.Canceled || ctx.Err() == context.DeadlineExceeded {
+				for _, req := range batch.requests {
+					rb.cancelInFlightTask(req.task, types.TaskRequestCancelled)
+				}
+			}
+			// Write 500 to all unfilled results
+			for i := range results {
+				if !results[i].filled {
+					errBody, _ := json.Marshal(map[string]interface{}{"error": "Internal server error"})
+					results[i] = batchResultItem{BatchIdx: i, StatusCode: http.StatusInternalServerError, Body: errBody, filled: true}
+				}
+			}
+			goto demux
+		}
+		defer resp.Body.Close()
+
+		var batchResponse struct {
+			BatchId string `json:"batch_id"`
+			Results []struct {
+				BatchIndex int                `json:"batch_index"`
+				StatusCode int                `json:"status_code"`
+				Body       stdjson.RawMessage `json:"body"`
+			} `json:"results"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&batchResponse); err != nil {
+			// Write 500 to all unfilled results
+			for i := range results {
+				if !results[i].filled {
+					errBody, _ := json.Marshal(map[string]interface{}{"error": "Internal server error"})
+					results[i] = batchResultItem{BatchIdx: i, StatusCode: http.StatusInternalServerError, Body: errBody, filled: true}
+				}
+			}
+			goto demux
+		}
+
+		for _, r := range batchResponse.Results {
+			if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
+				results[r.BatchIndex] = batchResultItem{
+					BatchIdx:   r.BatchIndex,
+					StatusCode: r.StatusCode,
+					Body:       r.Body,
+					filled:     true,
+				}
+			}
+		}
+	}
+
+demux:
+	// Write results to original request contexts (like handleHttpRequest does)
+	for i, result := range results {
+		// Defensive bounds check
+		if i >= len(batch.requests) {
+			continue
+		}
+		req := batch.requests[i]
+
+		// Skip if client disconnected (same as handleHttpRequest line 552)
+		if req.ctx.Request().Context().Err() == context.Canceled {
+			rb.cancelInFlightTask(req.task, types.TaskRequestCancelled)
+			continue
+		}
+
+		// If result wasn't filled (shouldn't happen), return 500 (same as handleHttpRequest line 517)
+		if !result.filled {
+			req.ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
+				"error": "Internal server error",
+			})
+			// Cancel task after writing response (same order as handleHttpRequest line 504)
+			rb.cancelInFlightTask(req.task, types.TaskInvalidRequestPayload)
+			continue
+		}
+
+		// Match handleHttpRequest semantics for invalid request payloads:
+		// write JSON error response, then cancel task.
+		if result.StatusCode == http.StatusBadRequest {
+			var errBody map[string]interface{}
+			if err := stdjson.Unmarshal(result.Body, &errBody); err != nil {
+				errBody = map[string]interface{}{
+					"error": "Internal server error",
+				}
+			}
+			req.ctx.JSON(http.StatusBadRequest, errBody)
+			rb.cancelInFlightTask(req.task, types.TaskInvalidRequestPayload)
+			continue
+		}
+
+		// Set response headers and status code before writing the body (same as handleHttpRequest line 559-565)
+		req.ctx.Response().Header().Set("Content-Type", "application/json")
+		req.ctx.Response().WriteHeader(result.StatusCode) // TODO: Add streaming for individual tasks in a batch: currently chunks after all tasks in a batch are complete (high TTFT)
+
+		// Check if we can stream the response (same as handleHttpRequest line 567-572)
+		flusher, ok := req.ctx.Response().Writer.(http.Flusher)
+
+		// Write body in chunks for large responses (same as handleHttpRequest line 574-594)
+		bodyReader := bytes.NewReader(result.Body)
+		buf := make([]byte, 4096)
+		for {
+			n, err := bodyReader.Read(buf)
+			if n > 0 {
+				req.ctx.Response().Writer.Write(buf[:n])
+				if ok {
+					flusher.Flush()
+				}
+			}
+			if err != nil {
+				if err != io.EOF && err != context.Canceled {
+					req.ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
+						"error": "Internal server error",
+					})
+				}
+				break
+			}
+		}
+	}
+
+	return nil
+}
+
 func (rb *RequestBuffer) cancelInFlightTask(task *EndpointTask, reason types.TaskCancellationReason) {
 	task.Cancel(context.Background(), reason)
 }
@@ -559,6 +917,45 @@ func (rb *RequestBuffer) heartBeat(req *request, containerId string) {
 			rb.rdb.Set(rb.ctx, Keys.endpointRequestHeartbeat(rb.workspace.Name, rb.stubId, req.task.msg.TaskId, containerId), 1, endpointRequestHeartbeatKeepAlive)
 		}
 	}
+}
+
+func (rb *RequestBuffer) batchHeartBeat(ctx context.Context, batchId string, containerId string, done <-chan struct{}) {
+	ticker := time.NewTicker(endpointRequestHeartbeatInterval)
+	defer ticker.Stop()
+
+	heartbeatKey := Keys.endpointRequestHeartbeat(rb.workspace.Name, rb.stubId, batchId, containerId)
+	rb.rdb.Set(rb.ctx, heartbeatKey, 1, endpointRequestHeartbeatKeepAlive)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-rb.ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			rb.rdb.Set(rb.ctx, heartbeatKey, 1, endpointRequestHeartbeatKeepAlive)
+		}
+	}
+}
+
+func (rb *RequestBuffer) afterBatchRequest(batch *batchBuffer, containerId string, batchId string) {
+	for _, req := range batch.requests {
+		close(req.done)
+	}
+
+	rb.releaseRequestToken(containerId, batchId)
+
+	if rb.stubConfig.KeepWarmSeconds == 0 {
+		return
+	}
+	rb.rdb.SetEx(
+		context.Background(),
+		Keys.endpointKeepWarmLock(rb.workspace.Name, rb.stubId, containerId),
+		1,
+		time.Duration(rb.stubConfig.KeepWarmSeconds)*time.Second,
+	)
 }
 
 func (rb *RequestBuffer) afterRequest(req *request, containerId string) {

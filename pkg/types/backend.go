@@ -433,6 +433,12 @@ func NewCheckpointFromProto(in *pb.Checkpoint) *Checkpoint {
 	}
 }
 
+// BatchConfig defines configuration for dynamic batching of endpoint requests.
+type BatchConfig struct {
+	MaxSize int `json:"max_batch_size"` // Maximum number of requests to batch together (must be > 0)
+	WaitMs  int `json:"wait_ms"`        // Maximum milliseconds to wait before processing batch (must be > 0)
+}
+
 type StubConfigV1 struct {
 	Runtime            Runtime         `json:"runtime"`
 	Handler            string          `json:"handler"`
@@ -463,6 +469,7 @@ type StubConfigV1 struct {
 	BlockNetwork       bool            `json:"block_network"`
 	AllowList          []string        `json:"allow_list"`
 	DockerEnabled      bool            `json:"docker_enabled"`
+	BatchConfig        *BatchConfig    `json:"batch_config,omitempty"`
 }
 
 type StubConfigLimitedValues struct {

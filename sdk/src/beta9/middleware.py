@@ -93,7 +93,8 @@ class WebsocketTaskLifecycleMiddleware:
 
 class TaskLifecycleMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health":
+        if request.url.path == "/health" or request.url.path == "/__batch__":
+            # ! Batched tasks skip the middleware. All middleware logic for batched tasks is handled in endpoint.py directly
             return await call_next(request)
 
         return await run_task(request, call_next, (request,))

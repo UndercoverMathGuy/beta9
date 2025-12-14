@@ -36,6 +36,7 @@ from ...sync import FileSyncer
 from ...type import (
     _AUTOSCALER_TYPES,
     Autoscaler,
+    Batch,
     GpuType,
     GpuTypeAlias,
     PricingPolicy,
@@ -120,6 +121,7 @@ class RunnerAbstraction(BaseAbstraction):
         block_network: bool = False,
         allow_list: Optional[List[str]] = None,
         docker_enabled: bool = False,
+        batch: Optional[Batch] = None,
     ) -> None:
         super().__init__()
 
@@ -183,6 +185,12 @@ class RunnerAbstraction(BaseAbstraction):
 
         if on_start is not None:
             self._map_callable_to_attr(attr="on_start", func=on_start)
+        
+        if batch is not None:
+            self.extra["batch_config"] = {
+                "max_batch_size": batch.max_size,  # Must match Go json tag
+                "wait_ms": batch.wait_ms,
+            }
 
         self._gateway_stub: Optional[GatewayServiceStub] = None
         self._shell_stub: Optional[ShellServiceStub] = None
