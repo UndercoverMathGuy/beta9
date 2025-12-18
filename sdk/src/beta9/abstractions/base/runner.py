@@ -518,6 +518,9 @@ class RunnerAbstraction(BaseAbstraction):
                     max_containers=self.autoscaler.max_containers,
                     tasks_per_container=self.autoscaler.tasks_per_container,
                     min_containers=self.autoscaler.min_containers,
+                    latency_threshold=getattr(self.autoscaler, "latency_threshold", 0),
+                    queue_velocity=getattr(self.autoscaler, "queue_velocity", 0),
+                    enable_criu_scaling=getattr(self.autoscaler, "enable_criu_scaling", False),
                 ),
                 task_policy=TaskPolicyProto(
                     max_retries=self.task_policy.max_retries,

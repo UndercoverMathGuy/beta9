@@ -283,6 +283,9 @@ class Autoscaler(betterproto.Message):
     max_containers: int = betterproto.uint32_field(2)
     tasks_per_container: int = betterproto.uint32_field(3)
     min_containers: int = betterproto.uint32_field(4)
+    latency_threshold: int = betterproto.uint32_field(5)
+    queue_velocity: int = betterproto.uint32_field(6)
+    enable_criu_scaling: bool = betterproto.bool_field(7)
 
 
 @dataclass(eq=False, repr=False)

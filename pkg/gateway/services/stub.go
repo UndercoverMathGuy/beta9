@@ -46,6 +46,9 @@ func (gws *GatewayService) GetOrCreateStub(ctx context.Context, in *pb.GetOrCrea
 		autoscaler.MaxContainers = uint(in.Autoscaler.MaxContainers)
 		autoscaler.TasksPerContainer = uint(in.Autoscaler.TasksPerContainer)
 		autoscaler.MinContainers = uint(in.Autoscaler.MinContainers)
+		autoscaler.LatencyThreshold = uint(in.Autoscaler.LatencyThreshold)
+		autoscaler.QueueVelocity = uint(in.Autoscaler.QueueVelocity)
+		autoscaler.EnableCRIUScaling = in.Autoscaler.EnableCriuScaling
 	}
 
 	// By default, pod deployments are scaled to 1 container

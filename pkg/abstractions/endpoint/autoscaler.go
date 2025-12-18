@@ -10,21 +10,29 @@ import (
 type endpointAutoscalerSample struct {
 	TotalRequests     int64
 	CurrentContainers int64
+	LatencyP95Ms      float64
+	QueueVelocity     float64
+	CheckpointReady   bool
 }
 
 func endpointSampleFunc(i *endpointInstance) (*endpointAutoscalerSample, error) {
 	totalRequests, err := i.TaskRepo.TasksInFlight(i.Ctx, i.Workspace.Name, i.Stub.ExternalId)
 	if err != nil {
-		totalRequests = -1
+		return &endpointAutoscalerSample{
+			TotalRequests:     -1,
+			CurrentContainers: -1,
+		}, err
 	}
 
-	currentContainers := 0
 	state, err := i.State()
 	if err != nil {
-		currentContainers = -1
+		return &endpointAutoscalerSample{
+			TotalRequests:     int64(totalRequests),
+			CurrentContainers: -1,
+		}, err
 	}
 
-	currentContainers = state.PendingContainers + state.RunningContainers
+	currentContainers := state.PendingContainers + state.RunningContainers
 
 	sample := &endpointAutoscalerSample{
 		TotalRequests:     int64(totalRequests),
@@ -34,17 +42,36 @@ func endpointSampleFunc(i *endpointInstance) (*endpointAutoscalerSample, error) 
 	return sample, nil
 }
 
+func endpointLatencySampleFunc(i *endpointInstance) (*endpointAutoscalerSample, error) {
+	baseSample, err := endpointSampleFunc(i)
+	if err != nil {
+		return baseSample, err
+	}
+	metrics, err := i.buffer.GetLatencyMetrics(i.buffer.ctx, i.Workspace.Name, i.buffer.stubId)
+	if err != nil {
+		return baseSample, err
+	}
+	baseSample.LatencyP95Ms = metrics.P95Ms
+	baseSample.QueueVelocity = metrics.QueueVelocity
+
+	baseSample.CheckpointReady = i.buffer.stubConfig.CheckpointEnabled
+
+	return baseSample, nil
+}
+
 func endpointDeploymentScaleFunc(i *endpointInstance, s *endpointAutoscalerSample) *abstractions.AutoscalerResult {
+	// Check for error states in sample
+	if s.TotalRequests == -1 || s.CurrentContainers == -1 {
+		return &abstractions.AutoscalerResult{
+			ResultValid: false,
+		}
+	}
+
 	desiredContainers := 0
 
 	if s.TotalRequests == 0 {
 		desiredContainers = 0
 	} else {
-		if s.TotalRequests == -1 {
-			return &abstractions.AutoscalerResult{
-				ResultValid: false,
-			}
-		}
 
 		tasksPerContainer := int64(1)
 		if i.StubConfig.Autoscaler != nil && i.StubConfig.Autoscaler.TasksPerContainer > 0 {
@@ -70,6 +97,55 @@ func endpointDeploymentScaleFunc(i *endpointInstance, s *endpointAutoscalerSampl
 		DesiredContainers: desiredContainers,
 		ResultValid:       true,
 	}
+}
+
+func latencyAwareEndpointScaleFunc(i *endpointInstance, s *endpointAutoscalerSample) *abstractions.AutoscalerResult {
+	// Check for error states in sample
+	if s.TotalRequests == -1 || s.CurrentContainers == -1 {
+		return &abstractions.AutoscalerResult{
+			ResultValid: false,
+		}
+	}
+
+	autoscaler := i.StubConfig.Autoscaler
+	if autoscaler == nil {
+		return endpointDeploymentScaleFunc(i, s)
+	}
+
+	// Calculate max allowed containers
+	maxContainers := int(autoscaler.MaxContainers)
+	if maxContainers == 0 {
+		maxContainers = 1
+	}
+	maxReplicas := int(math.Min(float64(maxContainers), float64(i.AppConfig.GatewayService.StubLimits.MaxReplicas)))
+
+	// Latency trigger: scale up if p95 exceeds threshold
+	if autoscaler.LatencyThreshold > 0 && s.LatencyP95Ms > float64(autoscaler.LatencyThreshold) {
+		desiredContainers := int(s.CurrentContainers) + 1
+		if desiredContainers > maxReplicas {
+			desiredContainers = maxReplicas
+		}
+		return &abstractions.AutoscalerResult{
+			DesiredContainers: desiredContainers,
+			ResultValid:       true,
+			CRIUScaling:       autoscaler.EnableCRIUScaling && s.CheckpointReady,
+		}
+	}
+
+	// Queue velocity trigger: scale up if velocity exceeds threshold
+	if autoscaler.QueueVelocity > 0 && s.QueueVelocity > float64(autoscaler.QueueVelocity) {
+		desiredContainers := int(s.CurrentContainers) + 1
+		if desiredContainers > maxReplicas {
+			desiredContainers = maxReplicas
+		}
+		return &abstractions.AutoscalerResult{
+			DesiredContainers: desiredContainers,
+			ResultValid:       true,
+			CRIUScaling:       autoscaler.EnableCRIUScaling && s.CheckpointReady,
+		}
+	}
+
+	return endpointDeploymentScaleFunc(i, s)
 }
 
 func endpointServeScaleFunc(i *endpointInstance, sample *endpointAutoscalerSample) *abstractions.AutoscalerResult {

@@ -284,7 +284,11 @@ func (es *HttpEndpointService) getOrCreateEndpointInstance(ctx context.Context, 
 
 	if instance.Autoscaler == nil {
 		if stub.Type.IsDeployment() {
-			instance.Autoscaler = abstractions.NewAutoscaler(instance, endpointSampleFunc, endpointDeploymentScaleFunc)
+			if instance.StubConfig.Autoscaler != nil && instance.StubConfig.Autoscaler.Type == types.LatencyAutoscaler {
+				instance.Autoscaler = abstractions.NewAutoscaler(instance, endpointLatencySampleFunc, latencyAwareEndpointScaleFunc)
+			} else {
+				instance.Autoscaler = abstractions.NewAutoscaler(instance, endpointSampleFunc, endpointDeploymentScaleFunc)
+			}
 		} else if stub.Type.IsServe() {
 			instance.Autoscaler = abstractions.NewAutoscaler(instance, endpointSampleFunc, endpointServeScaleFunc)
 		}
@@ -315,6 +319,8 @@ var (
 	endpointInstanceLock     string = "endpoint:%s:%s:instance_lock"
 	endpointRequestTokens    string = "endpoint:%s:%s:request_tokens:%s"
 	endpointRequestHeartbeat string = "endpoint:%s:%s:request_heartbeat:%s:%s"
+	endpointLatencyWindow    string = "endpoint:%s:%s:latency_window"
+	endpointQueueVelocity    string = "endpoint:%s:%s:queue_velocity"
 )
 
 func (k *keys) endpointKeepWarmLock(workspaceName, stubId, containerId string) string {
@@ -331,4 +337,10 @@ func (k *keys) endpointRequestTokens(workspaceName, stubId, containerId string) 
 
 func (k *keys) endpointRequestHeartbeat(workspaceName, stubId, taskId, containerId string) string {
 	return fmt.Sprintf(endpointRequestHeartbeat, workspaceName, stubId, taskId, containerId)
+}
+func (k *keys) endpointLatencyWindow(workspaceName, stubId string) string {
+	return fmt.Sprintf(endpointLatencyWindow, workspaceName, stubId)
+}
+func (k *keys) endpointQueueVelocity(workspaceName, stubId string) string {
+	return fmt.Sprintf(endpointQueueVelocity, workspaceName, stubId)
 }

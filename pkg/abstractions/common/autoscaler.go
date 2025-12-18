@@ -8,6 +8,7 @@ import (
 type AutoscalerResult struct {
 	DesiredContainers int
 	ResultValid       bool
+	CRIUScaling       bool
 }
 
 type Autoscaler[I IAutoscaledInstance, S AutoscalerSample] struct {

@@ -19,7 +19,7 @@ const IgnoreScalingEventInterval = 10 * time.Second
 type IAutoscaledInstance interface {
 	ConsumeScaleResult(*AutoscalerResult)
 	ConsumeContainerEvent(types.ContainerEvent)
-	HandleScalingEvent(int) error
+	HandleScalingEvent(*AutoscalerResult) error
 	Sync() error
 }
 
@@ -46,7 +46,7 @@ type AutoscaledInstanceConfig struct {
 	EventRepo           repository.EventRepository
 	TaskRepo            repository.TaskRepository
 	UsageMetricsRepo    repository.UsageMetricsRepository
-	StartContainersFunc func(containersToRun int) error
+	StartContainersFunc func(containersToRun int, useCRIU bool) error
 	StopContainersFunc  func(containersToStop int) error
 }
 
@@ -71,7 +71,7 @@ type AutoscaledInstance struct {
 	Scheduler          *scheduler.Scheduler
 	ContainerEventChan chan types.ContainerEvent
 	Containers         map[string]bool
-	ScaleEventChan     chan int
+	ScaleEventChan     chan *AutoscalerResult
 	EntryPoint         []string
 	Autoscaler         IAutoscaler
 
@@ -86,7 +86,7 @@ type AutoscaledInstance struct {
 	InstanceLockKey string
 
 	// Callbacks
-	StartContainersFunc func(containersToRun int) error
+	StartContainersFunc func(containersToRun int, useCRIU bool) error
 	StopContainersFunc  func(containersToStop int) error
 }
 
@@ -121,7 +121,7 @@ func NewAutoscaledInstance(ctx context.Context, cfg *AutoscaledInstanceConfig) (
 		UsageMetricsRepo:         cfg.UsageMetricsRepo,
 		Containers:               make(map[string]bool),
 		ContainerEventChan:       make(chan types.ContainerEvent, 1),
-		ScaleEventChan:           make(chan int, 1),
+		ScaleEventChan:           make(chan *AutoscalerResult, 1),
 		StartContainersFunc:      cfg.StartContainersFunc,
 		StopContainersFunc:       cfg.StopContainersFunc,
 		FailedContainerThreshold: failedContainerThreshold,
@@ -167,7 +167,9 @@ func (i *AutoscaledInstance) ConsumeScaleResult(result *AutoscalerResult) {
 		minContainers = 0
 	}
 
-	i.ScaleEventChan <- max(result.DesiredContainers, minContainers)
+	// Enforce minimum containers while preserving the full result
+	result.DesiredContainers = max(result.DesiredContainers, minContainers)
+	i.ScaleEventChan <- result
 }
 
 func (i *AutoscaledInstance) ConsumeContainerEvent(event types.ContainerEvent) {
@@ -200,13 +202,13 @@ func (i *AutoscaledInstance) Monitor() error {
 				log.Info().Str("instance_name", i.Name).Int("initial_count", initialContainerCount).Int("current_count", len(i.Containers)).Msg("scaled")
 			}
 
-		case desiredContainers := <-i.ScaleEventChan:
+		case scaleResult := <-i.ScaleEventChan:
 			// Ignore scaling events if we're in the ignore window
 			if time.Now().Before(ignoreScalingEventWindow) {
 				continue
 			}
 
-			if err := i.HandleScalingEvent(desiredContainers); err != nil {
+			if err := i.HandleScalingEvent(scaleResult); err != nil {
 				if _, ok := err.(*types.ThrottledByConcurrencyLimitError); ok {
 					if time.Now().After(ignoreScalingEventWindow) {
 						log.Info().Str("instance_name", i.Name).Msg("throttled by concurrency limit")
@@ -220,7 +222,7 @@ func (i *AutoscaledInstance) Monitor() error {
 	}
 }
 
-func (i *AutoscaledInstance) HandleScalingEvent(desiredContainers int) error {
+func (i *AutoscaledInstance) HandleScalingEvent(result *AutoscalerResult) error {
 	err := i.Lock.Acquire(context.Background(), i.InstanceLockKey, common.RedisLockOptions{TtlS: 10, Retries: 0})
 	if err != nil {
 		return err
@@ -231,6 +233,8 @@ func (i *AutoscaledInstance) HandleScalingEvent(desiredContainers int) error {
 	if err != nil {
 		return err
 	}
+
+	desiredContainers := result.DesiredContainers
 
 	if len(state.FailedContainers) >= i.FailedContainerThreshold {
 		desiredContainers = 0
@@ -248,9 +252,17 @@ func (i *AutoscaledInstance) HandleScalingEvent(desiredContainers int) error {
 
 	containerDelta := desiredContainers - (state.RunningContainers + state.PendingContainers)
 	if containerDelta > 0 {
-		err = i.StartContainersFunc(containerDelta)
+		// Use CRIU scaling flag from the autoscaler result (dynamic decision based on latency/checkpoint readiness)
+		useCRIU := i.StubConfig.CheckpointEnabled && result.CRIUScaling
+		err = i.StartContainersFunc(containerDelta, useCRIU)
+		if err != nil {
+			return err
+		}
 	} else if containerDelta < 0 {
 		err = i.StopContainersFunc(-containerDelta)
+		if err != nil {
+			return err
+		}
 	}
 
 	if len(state.FailedContainers) > 0 {
@@ -429,7 +441,11 @@ func (c *InstanceController) Warmup(
 		return err
 	}
 
-	return instance.HandleScalingEvent(1)
+	return instance.HandleScalingEvent(&AutoscalerResult{
+		DesiredContainers: 1,
+		ResultValid:       true,
+		CRIUScaling:       false,
+	})
 }
 
 func (c *InstanceController) Load(filter *types.DeploymentFilter) error {

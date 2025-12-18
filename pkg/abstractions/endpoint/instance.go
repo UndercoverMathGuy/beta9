@@ -32,7 +32,7 @@ type endpointInstance struct {
 	isASGI bool
 }
 
-func (i *endpointInstance) startContainers(containersToRun int) error {
+func (i *endpointInstance) startContainers(containersToRun int, useCRIU bool) error {
 	secrets, err := abstractions.ConfigureContainerRequestSecrets(i.Workspace, *i.buffer.stubConfig)
 	if err != nil {
 		return err
@@ -101,7 +101,7 @@ func (i *endpointInstance) startContainers(containersToRun int) error {
 			EntryPoint:        i.EntryPoint,
 			Mounts:            mounts,
 			Stub:              *i.Stub,
-			CheckpointEnabled: checkpointEnabled,
+			CheckpointEnabled: checkpointEnabled || useCRIU,
 			Preemptable:       true,
 		}
 

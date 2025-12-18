@@ -393,6 +393,9 @@ message Autoscaler {
   uint32 max_containers = 2;
   uint32 tasks_per_container = 3;
   uint32 min_containers = 4;
+  uint32 latency_threshold = 5;
+  uint32 queue_velocity = 6;
+  bool enable_criu_scaling = 7;
 }
 
 message TaskPolicy {

@@ -540,6 +540,7 @@ type AutoscalerType string
 
 const (
 	QueueDepthAutoscaler AutoscalerType = "queue_depth"
+	LatencyAutoscaler    AutoscalerType = "latency"
 )
 
 type Autoscaler struct {
@@ -547,6 +548,9 @@ type Autoscaler struct {
 	MaxContainers     uint           `json:"max_containers"`
 	TasksPerContainer uint           `json:"tasks_per_container"`
 	MinContainers     uint           `json:"min_containers"`
+	LatencyThreshold  uint           `json:"latency_threshold"`
+	QueueVelocity 	  uint 			 `json:"queue_velocity"`
+	EnableCRIUScaling bool 			 `json:"enable_criu_scaling"`
 }
 
 // @go2proto

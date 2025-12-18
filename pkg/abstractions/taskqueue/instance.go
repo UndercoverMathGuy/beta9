@@ -30,7 +30,7 @@ type taskQueueInstance struct {
 	client *taskQueueClient
 }
 
-func (i *taskQueueInstance) startContainers(containersToRun int) error {
+func (i *taskQueueInstance) startContainers(containersToRun int, useCRIU bool) error {
 	secrets, err := abstractions.ConfigureContainerRequestSecrets(i.Workspace, *i.StubConfig)
 	if err != nil {
 		return err

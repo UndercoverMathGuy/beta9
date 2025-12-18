@@ -142,6 +142,8 @@ func (rb *RequestBuffer) handleHeartbeatEvents() {
 }
 
 func (rb *RequestBuffer) ForwardRequest(ctx echo.Context, task *EndpointTask) error {
+	rb.rdb.Incr(rb.ctx, Keys.endpointQueueVelocity(rb.workspace.Name, rb.stubId))
+	rb.rdb.Expire(rb.ctx, Keys.endpointQueueVelocity(rb.workspace.Name, rb.stubId), 1*time.Second)
 	ctx.Set("stubId", rb.stubId)
 
 	done := make(chan struct{})
@@ -455,6 +457,8 @@ func (rb *RequestBuffer) getHttpClient(address string, timeout time.Duration) (*
 }
 
 func (rb *RequestBuffer) handleRequest(req *request) {
+	// Record latency for autoscaling
+	start := time.Now()
 	rb.availableContainersLock.RLock()
 
 	if len(rb.availableContainers) == 0 {
@@ -482,9 +486,13 @@ func (rb *RequestBuffer) handleRequest(req *request) {
 	} else {
 		rb.handleHttpRequest(req, c)
 	}
+	latency := time.Since(start)
+	rb.RecordLatency(latency)
 }
 
 func (rb *RequestBuffer) handleBatchRequest(batch *batchBuffer) {
+	// Record latency for autoscaling
+	start := time.Now()
 	rb.availableContainersLock.RLock()
 
 	if len(rb.availableContainers) == 0 {
@@ -513,6 +521,15 @@ func (rb *RequestBuffer) handleBatchRequest(batch *batchBuffer) {
 	go rb.batchHeartBeat(rb.ctx, batch.batchId, c.id, done)
 	rb.handleBatchHttpRequest(batch, c, batch.batchId)
 	close(done)
+	latency := time.Since(start)
+	rb.RecordLatency(latency)
+}
+
+func (rb *RequestBuffer) RecordLatency(latency time.Duration) {
+	key := Keys.endpointLatencyWindow(rb.workspace.Name, rb.stubId)
+	rb.rdb.LPush(rb.ctx, key, latency.Milliseconds())
+	rb.rdb.LTrim(rb.ctx, key, 0, 99)
+	rb.rdb.Expire(rb.ctx, key, 5*time.Minute)
 }
 
 func (rb *RequestBuffer) handleWSRequest(req *request, c container) {

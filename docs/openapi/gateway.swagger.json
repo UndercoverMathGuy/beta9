@@ -1053,6 +1053,17 @@
         "minContainers": {
           "type": "integer",
           "format": "int64"
+        },
+        "latencyThreshold": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "queueVelocity": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "enableCriuScaling": {
+          "type": "boolean"
         }
       }
     },

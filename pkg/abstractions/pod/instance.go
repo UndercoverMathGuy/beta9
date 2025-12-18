@@ -19,7 +19,7 @@ type podInstance struct {
 	buffer *PodProxyBuffer
 }
 
-func (i *podInstance) startContainers(containersToRun int) error {
+func (i *podInstance) startContainers(containersToRun int, useCRIU bool) error {
 	secrets, err := abstractions.ConfigureContainerRequestSecrets(i.Workspace, *i.StubConfig)
 	if err != nil {
 		return err
