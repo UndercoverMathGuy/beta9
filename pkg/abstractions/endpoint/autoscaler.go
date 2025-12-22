@@ -93,6 +93,14 @@ func endpointDeploymentScaleFunc(i *endpointInstance, s *endpointAutoscalerSampl
 		desiredContainers = int(math.Min(maxReplicas, float64(desiredContainers)))
 	}
 
+	// Enforce MinContainers floor
+	if i.StubConfig.Autoscaler != nil && i.StubConfig.Autoscaler.MinContainers > 0 {
+		minContainers := int(i.StubConfig.Autoscaler.MinContainers)
+		if desiredContainers < minContainers {
+			desiredContainers = minContainers
+		}
+	}
+
 	return &abstractions.AutoscalerResult{
 		DesiredContainers: desiredContainers,
 		ResultValid:       true,
@@ -119,12 +127,23 @@ func latencyAwareEndpointScaleFunc(i *endpointInstance, s *endpointAutoscalerSam
 	}
 	maxReplicas := int(math.Min(float64(maxContainers), float64(i.AppConfig.GatewayService.StubLimits.MaxReplicas)))
 
+	// Calculate min containers floor
+	minContainers := int(autoscaler.MinContainers)
+
+	// Helper to enforce min/max bounds
+	clampContainers := func(desired int) int {
+		if desired < minContainers {
+			desired = minContainers
+		}
+		if desired > maxReplicas {
+			desired = maxReplicas
+		}
+		return desired
+	}
+
 	// Latency trigger: scale up if p95 exceeds threshold
 	if autoscaler.LatencyThreshold > 0 && s.LatencyP95Ms > float64(autoscaler.LatencyThreshold) {
-		desiredContainers := int(s.CurrentContainers) + 1
-		if desiredContainers > maxReplicas {
-			desiredContainers = maxReplicas
-		}
+		desiredContainers := clampContainers(int(s.CurrentContainers) + 1)
 		return &abstractions.AutoscalerResult{
 			DesiredContainers: desiredContainers,
 			ResultValid:       true,
@@ -134,10 +153,7 @@ func latencyAwareEndpointScaleFunc(i *endpointInstance, s *endpointAutoscalerSam
 
 	// Queue velocity trigger: scale up if velocity exceeds threshold
 	if autoscaler.QueueVelocity > 0 && s.QueueVelocity > float64(autoscaler.QueueVelocity) {
-		desiredContainers := int(s.CurrentContainers) + 1
-		if desiredContainers > maxReplicas {
-			desiredContainers = maxReplicas
-		}
+		desiredContainers := clampContainers(int(s.CurrentContainers) + 1)
 		return &abstractions.AutoscalerResult{
 			DesiredContainers: desiredContainers,
 			ResultValid:       true,
@@ -145,6 +161,7 @@ func latencyAwareEndpointScaleFunc(i *endpointInstance, s *endpointAutoscalerSam
 		}
 	}
 
+	// Fallback to queue-depth scaling (which also enforces MinContainers)
 	return endpointDeploymentScaleFunc(i, s)
 }
 
