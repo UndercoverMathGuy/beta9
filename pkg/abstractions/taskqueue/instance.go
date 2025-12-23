@@ -64,7 +64,7 @@ func (i *taskQueueInstance) startContainers(containersToRun int, useCRIU bool) e
 		gpuCount = 1
 	}
 
-	checkpointEnabled := i.StubConfig.CheckpointEnabled
+	checkpointEnabled := i.StubConfig.CheckpointEnabled || useCRIU
 	if gpuCount > 1 {
 		checkpointEnabled = false
 	}

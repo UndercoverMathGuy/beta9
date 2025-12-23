@@ -2,40 +2,138 @@ package endpoint
 
 import (
 	stdjson "encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 
 	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
+// =============================================================================
+// TEST HELPERS - Abstracted common operations
+// =============================================================================
 
-// Positive: Single request batch processes correctly
-func TestBatch_Positive_SingleRequest(t *testing.T) {
-	// Single request in a batch should work identically to non-batched
-	items := []batchItem{
-		{TaskId: "task-0", BatchIdx: 0, Payload: &types.TaskPayload{Args: []interface{}{"hello"}}},
-	}
+// batchResponseResult represents a single result from Python's batch response
+type batchResponseResult struct {
+	BatchIndex int                `json:"batch_index"`
+	StatusCode int                `json:"status_code"`
+	Body       stdjson.RawMessage `json:"body"`
+}
 
-	// Build payload
+// parsedBatchResponse represents the full Python batch response
+type parsedBatchResponse struct {
+	BatchId string                `json:"batch_id"`
+	Results []batchResponseResult `json:"results"`
+}
+
+// buildValidItems converts batch items to the payload format sent to Python
+func buildValidItems(items []batchItem) []map[string]interface{} {
 	validItems := make([]map[string]interface{}, 0)
 	for _, item := range items {
+		if item.Error == nil {
+			validItems = append(validItems, map[string]interface{}{
+				"batch_index": item.BatchIdx,
+				"task_id":     item.TaskId,
+				"payload":     item.Payload,
+			})
+		}
+	}
+	return validItems
+}
+
+// buildBatchPayload creates the full batch payload structure
+func buildBatchPayload(batchId string, items []batchItem) map[string]interface{} {
+	return map[string]interface{}{
+		"batch_id": batchId,
+		"items":    buildValidItems(items),
+	}
+}
+
+// parseBatchResponse parses a Python batch response JSON string
+func parseBatchResponse(t *testing.T, jsonStr string) parsedBatchResponse {
+	t.Helper()
+	var resp parsedBatchResponse
+	err := stdjson.Unmarshal([]byte(jsonStr), &resp)
+	require.NoError(t, err)
+	return resp
+}
+
+// demuxResults applies the demux logic to map batch responses to results array
+func demuxResults(response parsedBatchResponse, resultCount int) []batchResultItem {
+	results := make([]batchResultItem, resultCount)
+	for _, r := range response.Results {
+		if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
+			results[r.BatchIndex] = batchResultItem{
+				BatchIdx:   r.BatchIndex,
+				StatusCode: r.StatusCode,
+				Body:       r.Body,
+				filled:     true,
+			}
+		}
+	}
+	return results
+}
+
+// prefillErrorResult creates a pre-filled error result for a failed batch item
+func prefillErrorResult(idx int, err error) batchResultItem {
+	errBody, _ := stdjson.Marshal(map[string]interface{}{"error": err.Error()})
+	return batchResultItem{
+		BatchIdx:   idx,
+		StatusCode: http.StatusBadRequest,
+		Body:       errBody,
+		filled:     true,
+	}
+}
+
+// processItemsWithErrors processes batch items, pre-filling errors and collecting valid items
+func processItemsWithErrors(items []batchItem) ([]batchResultItem, []map[string]interface{}) {
+	results := make([]batchResultItem, len(items))
+	validItems := make([]map[string]interface{}, 0)
+
+	for i, item := range items {
+		if item.Error != nil {
+			results[i] = prefillErrorResult(i, item.Error)
+			continue
+		}
 		validItems = append(validItems, map[string]interface{}{
 			"batch_index": item.BatchIdx,
 			"task_id":     item.TaskId,
 			"payload":     item.Payload,
 		})
 	}
+	return results, validItems
+}
 
-	batchPayload := map[string]interface{}{
-		"batch_id": "batch-single",
-		"items":    validItems,
+// applyDemuxToResults applies demux results to an existing results array (for pre-filled errors)
+func applyDemuxToResults(results []batchResultItem, response parsedBatchResponse) {
+	for _, r := range response.Results {
+		if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
+			results[r.BatchIndex] = batchResultItem{
+				BatchIdx:   r.BatchIndex,
+				StatusCode: r.StatusCode,
+				Body:       r.Body,
+				filled:     true,
+			}
+		}
+	}
+}
+
+// =============================================================================
+// POSITIVE TESTS - Happy Path Scenarios
+// =============================================================================
+
+// Positive: Single request batch processes correctly
+func TestBatch_Positive_SingleRequest(t *testing.T) {
+	items := []batchItem{
+		{TaskId: "task-0", BatchIdx: 0, Payload: &types.TaskPayload{Args: []interface{}{"hello"}}},
 	}
 
-	jsonBytes, err := stdjson.Marshal(batchPayload)
+	payload := buildBatchPayload("batch-single", items)
+	jsonBytes, err := stdjson.Marshal(payload)
 	assert.NoError(t, err)
 
-	// Verify structure
 	var parsed map[string]interface{}
 	err = stdjson.Unmarshal(jsonBytes, &parsed)
 	assert.NoError(t, err)
@@ -51,15 +149,7 @@ func TestBatch_Positive_MultipleRequests(t *testing.T) {
 		{TaskId: "task-2", BatchIdx: 2, Payload: &types.TaskPayload{Args: []interface{}{"c"}}},
 	}
 
-	validItems := make([]map[string]interface{}, 0)
-	for _, item := range items {
-		validItems = append(validItems, map[string]interface{}{
-			"batch_index": item.BatchIdx,
-			"task_id":     item.TaskId,
-			"payload":     item.Payload,
-		})
-	}
-
+	validItems := buildValidItems(items)
 	assert.Len(t, validItems, 3)
 	assert.Equal(t, 0, validItems[0]["batch_index"])
 	assert.Equal(t, 1, validItems[1]["batch_index"])
@@ -77,31 +167,9 @@ func TestBatch_Positive_AllSuccessfulResponses(t *testing.T) {
 		]
 	}`
 
-	var batchResponse struct {
-		BatchId string `json:"batch_id"`
-		Results []struct {
-			BatchIndex int                `json:"batch_index"`
-			StatusCode int                `json:"status_code"`
-			Body       stdjson.RawMessage `json:"body"`
-		} `json:"results"`
-	}
+	resp := parseBatchResponse(t, pythonResponse)
+	results := demuxResults(resp, 3)
 
-	err := stdjson.Unmarshal([]byte(pythonResponse), &batchResponse)
-	assert.NoError(t, err)
-
-	results := make([]batchResultItem, 3)
-	for _, r := range batchResponse.Results {
-		if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
-			results[r.BatchIndex] = batchResultItem{
-				BatchIdx:   r.BatchIndex,
-				StatusCode: r.StatusCode,
-				Body:       r.Body,
-				filled:     true,
-			}
-		}
-	}
-
-	// All results should be filled with 200 status
 	for i, result := range results {
 		assert.True(t, result.filled, "result %d should be filled", i)
 		assert.Equal(t, 200, result.StatusCode, "result %d should have 200 status", i)
@@ -161,21 +229,13 @@ func TestBatch_Positive_LargeBatch(t *testing.T) {
 	items := make([]batchItem, batchSize)
 	for i := 0; i < batchSize; i++ {
 		items[i] = batchItem{
-			TaskId:   "task-" + string(rune('0'+i%10)),
+			TaskId:   fmt.Sprintf("task-%d", i),
 			BatchIdx: i,
 			Payload:  &types.TaskPayload{Args: []interface{}{i}},
 		}
 	}
 
-	validItems := make([]map[string]interface{}, 0)
-	for _, item := range items {
-		validItems = append(validItems, map[string]interface{}{
-			"batch_index": item.BatchIdx,
-			"task_id":     item.TaskId,
-			"payload":     item.Payload,
-		})
-	}
-
+	validItems := buildValidItems(items)
 	assert.Len(t, validItems, batchSize)
 
 	// Verify all indices are sequential
@@ -190,37 +250,20 @@ func TestBatch_Positive_LargeBatch(t *testing.T) {
 
 // IdealFlow: Complete batch lifecycle from request collection to response demux
 func TestBatch_IdealFlow_CompleteLifecycle(t *testing.T) {
-	// Phase 1: Collect requests into batch items
 	items := []batchItem{
 		{TaskId: "task-a", BatchIdx: 0, Payload: &types.TaskPayload{Args: []interface{}{"input_a"}}},
 		{TaskId: "task-b", BatchIdx: 1, Payload: &types.TaskPayload{Args: []interface{}{"input_b"}}},
 		{TaskId: "task-c", BatchIdx: 2, Payload: &types.TaskPayload{Args: []interface{}{"input_c"}}},
 	}
 
-	// Phase 2: Build batch payload for Python
-	results := make([]batchResultItem, len(items))
-	validItems := make([]map[string]interface{}, 0)
-
-	for _, item := range items {
-		validItems = append(validItems, map[string]interface{}{
-			"batch_index": item.BatchIdx,
-			"task_id":     item.TaskId,
-			"payload":     item.Payload,
-		})
-	}
-
-	batchPayload := map[string]interface{}{
-		"batch_id": "lifecycle-batch",
-		"items":    validItems,
-	}
-
-	// Verify payload structure
-	jsonBytes, err := stdjson.Marshal(batchPayload)
+	// Build and verify payload
+	payload := buildBatchPayload("lifecycle-batch", items)
+	jsonBytes, err := stdjson.Marshal(payload)
 	assert.NoError(t, err)
 	assert.Contains(t, string(jsonBytes), "lifecycle-batch")
 	assert.Contains(t, string(jsonBytes), "task-a")
 
-	// Phase 3: Simulate Python response
+	// Simulate Python response and demux
 	pythonResponse := `{
 		"batch_id": "lifecycle-batch",
 		"results": [
@@ -230,27 +273,8 @@ func TestBatch_IdealFlow_CompleteLifecycle(t *testing.T) {
 		]
 	}`
 
-	var batchResponse struct {
-		BatchId string `json:"batch_id"`
-		Results []struct {
-			BatchIndex int                `json:"batch_index"`
-			StatusCode int                `json:"status_code"`
-			Body       stdjson.RawMessage `json:"body"`
-		} `json:"results"`
-	}
-	stdjson.Unmarshal([]byte(pythonResponse), &batchResponse)
-
-	// Phase 4: Demux responses back to original requests
-	for _, r := range batchResponse.Results {
-		if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
-			results[r.BatchIndex] = batchResultItem{
-				BatchIdx:   r.BatchIndex,
-				StatusCode: r.StatusCode,
-				Body:       r.Body,
-				filled:     true,
-			}
-		}
-	}
+	resp := parseBatchResponse(t, pythonResponse)
+	results := demuxResults(resp, len(items))
 
 	// Verify all results are correctly mapped
 	assert.True(t, results[0].filled)
@@ -265,15 +289,6 @@ func TestBatch_IdealFlow_CompleteLifecycle(t *testing.T) {
 
 // IdealFlow: Mixed success/error responses handled correctly
 func TestBatch_IdealFlow_MixedResponses(t *testing.T) {
-	items := []batchItem{
-		{TaskId: "task-0", BatchIdx: 0, Payload: &types.TaskPayload{}},
-		{TaskId: "task-1", BatchIdx: 1, Payload: &types.TaskPayload{}},
-		{TaskId: "task-2", BatchIdx: 2, Payload: &types.TaskPayload{}},
-	}
-
-	results := make([]batchResultItem, len(items))
-
-	// Python returns mixed results
 	pythonResponse := `{
 		"batch_id": "mixed-batch",
 		"results": [
@@ -283,25 +298,8 @@ func TestBatch_IdealFlow_MixedResponses(t *testing.T) {
 		]
 	}`
 
-	var batchResponse struct {
-		Results []struct {
-			BatchIndex int                `json:"batch_index"`
-			StatusCode int                `json:"status_code"`
-			Body       stdjson.RawMessage `json:"body"`
-		} `json:"results"`
-	}
-	stdjson.Unmarshal([]byte(pythonResponse), &batchResponse)
-
-	for _, r := range batchResponse.Results {
-		if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
-			results[r.BatchIndex] = batchResultItem{
-				BatchIdx:   r.BatchIndex,
-				StatusCode: r.StatusCode,
-				Body:       r.Body,
-				filled:     true,
-			}
-		}
-	}
+	resp := parseBatchResponse(t, pythonResponse)
+	results := demuxResults(resp, 3)
 
 	// Verify mixed results
 	assert.Equal(t, 200, results[0].StatusCode)
@@ -313,34 +311,13 @@ func TestBatch_IdealFlow_MixedResponses(t *testing.T) {
 
 // IdealFlow: Batch with pre-serialization errors handled correctly
 func TestBatch_IdealFlow_PreSerializationErrors(t *testing.T) {
-	// Some items fail during serialization (before sending to Python)
 	items := []batchItem{
 		{TaskId: "task-0", BatchIdx: 0, Payload: &types.TaskPayload{}, Error: nil},
 		{TaskId: "task-1", BatchIdx: 1, Error: assert.AnError}, // Serialization failed
 		{TaskId: "task-2", BatchIdx: 2, Payload: &types.TaskPayload{}, Error: nil},
 	}
 
-	results := make([]batchResultItem, len(items))
-	validItems := make([]map[string]interface{}, 0)
-
-	// Pre-fill errors, collect valid items
-	for i, item := range items {
-		if item.Error != nil {
-			errBody, _ := stdjson.Marshal(map[string]interface{}{"error": item.Error.Error()})
-			results[i] = batchResultItem{
-				BatchIdx:   i,
-				StatusCode: http.StatusBadRequest,
-				Body:       errBody,
-				filled:     true,
-			}
-			continue
-		}
-		validItems = append(validItems, map[string]interface{}{
-			"batch_index": item.BatchIdx,
-			"task_id":     item.TaskId,
-			"payload":     item.Payload,
-		})
-	}
+	results, validItems := processItemsWithErrors(items)
 
 	// Only valid items sent to Python
 	assert.Len(t, validItems, 2)
@@ -355,25 +332,8 @@ func TestBatch_IdealFlow_PreSerializationErrors(t *testing.T) {
 		]
 	}`
 
-	var batchResponse struct {
-		Results []struct {
-			BatchIndex int                `json:"batch_index"`
-			StatusCode int                `json:"status_code"`
-			Body       stdjson.RawMessage `json:"body"`
-		} `json:"results"`
-	}
-	stdjson.Unmarshal([]byte(pythonResponse), &batchResponse)
-
-	for _, r := range batchResponse.Results {
-		if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
-			results[r.BatchIndex] = batchResultItem{
-				BatchIdx:   r.BatchIndex,
-				StatusCode: r.StatusCode,
-				Body:       r.Body,
-				filled:     true,
-			}
-		}
-	}
+	resp := parseBatchResponse(t, pythonResponse)
+	applyDemuxToResults(results, resp)
 
 	// Verify all results filled correctly
 	assert.True(t, results[0].filled)
@@ -531,7 +491,6 @@ func TestBatchPayload_Atom_ProtocolStructure(t *testing.T) {
 
 // Atom 4: Response demux correctly maps batch_index to results array
 func TestBatchDemux_Atom_IndexMapping(t *testing.T) {
-	// Simulate Python response (may be out of order or sparse)
 	pythonResponse := `{
 		"batch_id": "batch-123",
 		"results": [
@@ -541,31 +500,8 @@ func TestBatchDemux_Atom_IndexMapping(t *testing.T) {
 		]
 	}`
 
-	var batchResponse struct {
-		BatchId string `json:"batch_id"`
-		Results []struct {
-			BatchIndex int                `json:"batch_index"`
-			StatusCode int                `json:"status_code"`
-			Body       stdjson.RawMessage `json:"body"`
-		} `json:"results"`
-	}
-
-	err := stdjson.Unmarshal([]byte(pythonResponse), &batchResponse)
-	assert.NoError(t, err)
-
-	// Simulate demux logic from handleBatchHttpRequest
-	results := make([]batchResultItem, 3) // 3 original requests
-
-	for _, r := range batchResponse.Results {
-		if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
-			results[r.BatchIndex] = batchResultItem{
-				BatchIdx:   r.BatchIndex,
-				StatusCode: r.StatusCode,
-				Body:       r.Body,
-				filled:     true,
-			}
-		}
-	}
+	resp := parseBatchResponse(t, pythonResponse)
+	results := demuxResults(resp, 3)
 
 	// Verify demux worked correctly despite out-of-order response
 	assert.True(t, results[0].filled)
@@ -580,7 +516,6 @@ func TestBatchDemux_Atom_IndexMapping(t *testing.T) {
 
 // Atom 4b: Demux handles missing batch indices gracefully
 func TestBatchDemux_Atom_MissingIndices(t *testing.T) {
-	// Python only returns results for indices 0 and 2, missing 1
 	pythonResponse := `{
 		"batch_id": "batch-123",
 		"results": [
@@ -589,30 +524,8 @@ func TestBatchDemux_Atom_MissingIndices(t *testing.T) {
 		]
 	}`
 
-	var batchResponse struct {
-		BatchId string `json:"batch_id"`
-		Results []struct {
-			BatchIndex int                `json:"batch_index"`
-			StatusCode int                `json:"status_code"`
-			Body       stdjson.RawMessage `json:"body"`
-		} `json:"results"`
-	}
-
-	err := stdjson.Unmarshal([]byte(pythonResponse), &batchResponse)
-	assert.NoError(t, err)
-
-	results := make([]batchResultItem, 3)
-
-	for _, r := range batchResponse.Results {
-		if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
-			results[r.BatchIndex] = batchResultItem{
-				BatchIdx:   r.BatchIndex,
-				StatusCode: r.StatusCode,
-				Body:       r.Body,
-				filled:     true,
-			}
-		}
-	}
+	resp := parseBatchResponse(t, pythonResponse)
+	results := demuxResults(resp, 3)
 
 	assert.True(t, results[0].filled)
 	assert.False(t, results[1].filled, "index 1 should remain unfilled")
@@ -630,30 +543,8 @@ func TestBatchDemux_Atom_OutOfBoundsIndex(t *testing.T) {
 		]
 	}`
 
-	var batchResponse struct {
-		BatchId string `json:"batch_id"`
-		Results []struct {
-			BatchIndex int                `json:"batch_index"`
-			StatusCode int                `json:"status_code"`
-			Body       stdjson.RawMessage `json:"body"`
-		} `json:"results"`
-	}
-
-	err := stdjson.Unmarshal([]byte(pythonResponse), &batchResponse)
-	assert.NoError(t, err)
-
-	results := make([]batchResultItem, 2) // Only 2 slots
-
-	for _, r := range batchResponse.Results {
-		if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
-			results[r.BatchIndex] = batchResultItem{
-				BatchIdx:   r.BatchIndex,
-				StatusCode: r.StatusCode,
-				Body:       r.Body,
-				filled:     true,
-			}
-		}
-	}
+	resp := parseBatchResponse(t, pythonResponse)
+	results := demuxResults(resp, 2) // Only 2 slots
 
 	assert.True(t, results[0].filled, "index 0 should be filled")
 	assert.False(t, results[1].filled, "index 1 should remain unfilled (no valid response)")
@@ -670,30 +561,8 @@ func TestBatchDemux_Atom_NoOverwrite(t *testing.T) {
 		]
 	}`
 
-	var batchResponse struct {
-		BatchId string `json:"batch_id"`
-		Results []struct {
-			BatchIndex int                `json:"batch_index"`
-			StatusCode int                `json:"status_code"`
-			Body       stdjson.RawMessage `json:"body"`
-		} `json:"results"`
-	}
-
-	err := stdjson.Unmarshal([]byte(pythonResponse), &batchResponse)
-	assert.NoError(t, err)
-
-	results := make([]batchResultItem, 1)
-
-	for _, r := range batchResponse.Results {
-		if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
-			results[r.BatchIndex] = batchResultItem{
-				BatchIdx:   r.BatchIndex,
-				StatusCode: r.StatusCode,
-				Body:       r.Body,
-				filled:     true,
-			}
-		}
-	}
+	resp := parseBatchResponse(t, pythonResponse)
+	results := demuxResults(resp, 1)
 
 	// First result should win
 	assert.Equal(t, 200, results[0].StatusCode, "first result should not be overwritten")
@@ -706,36 +575,13 @@ func TestBatchDemux_Atom_NoOverwrite(t *testing.T) {
 
 // Atom 5: Error items are pre-filled with 400 status before sending to container
 func TestBatchErrorPreFill_Atom_BadRequestStatus(t *testing.T) {
-	// Simulate what happens when parseBatchItems returns an error for an item
 	items := []batchItem{
 		{TaskId: "task-0", BatchIdx: 0, Payload: &types.TaskPayload{}, Error: nil},
 		{TaskId: "task-1", BatchIdx: 1, Error: assert.AnError}, // This one has an error
 		{TaskId: "task-2", BatchIdx: 2, Payload: &types.TaskPayload{}, Error: nil},
 	}
 
-	results := make([]batchResultItem, len(items))
-	validItems := make([]map[string]interface{}, 0)
-
-	for i, item := range items {
-		if item.Error != nil {
-			// Pre-fill error result (same logic as handleBatchHttpRequest)
-			errBody, _ := stdjson.Marshal(map[string]interface{}{
-				"error": item.Error.Error(),
-			})
-			results[i] = batchResultItem{
-				BatchIdx:   i,
-				StatusCode: http.StatusBadRequest,
-				Body:       errBody,
-				filled:     true,
-			}
-			continue
-		}
-		validItems = append(validItems, map[string]interface{}{
-			"batch_index": item.BatchIdx,
-			"task_id":     item.TaskId,
-			"payload":     item.Payload,
-		})
-	}
+	results, validItems := processItemsWithErrors(items)
 
 	// Verify error item is pre-filled
 	assert.True(t, results[1].filled)
@@ -809,31 +655,14 @@ func TestBatchBuffer_Atom_Metadata(t *testing.T) {
 
 // Interop: Full batch round-trip simulation (without HTTP)
 func TestBatch_Interop_RoundTrip(t *testing.T) {
-	// Step 1: Create batch items (simulating parseBatchItems)
 	items := []batchItem{
 		{TaskId: "task-0", BatchIdx: 0, Payload: &types.TaskPayload{Args: []interface{}{"a"}}},
 		{TaskId: "task-1", BatchIdx: 1, Error: assert.AnError}, // Error item
 		{TaskId: "task-2", BatchIdx: 2, Payload: &types.TaskPayload{Args: []interface{}{"c"}}},
 	}
 
-	// Step 2: Build payload and pre-fill errors
-	results := make([]batchResultItem, len(items))
-	validItems := make([]map[string]interface{}, 0)
+	results, _ := processItemsWithErrors(items)
 
-	for i, item := range items {
-		if item.Error != nil {
-			errBody, _ := stdjson.Marshal(map[string]interface{}{"error": item.Error.Error()})
-			results[i] = batchResultItem{BatchIdx: i, StatusCode: 400, Body: errBody, filled: true}
-			continue
-		}
-		validItems = append(validItems, map[string]interface{}{
-			"batch_index": item.BatchIdx,
-			"task_id":     item.TaskId,
-			"payload":     item.Payload,
-		})
-	}
-
-	// Step 3: Simulate Python response (only for valid items)
 	pythonResponse := `{
 		"batch_id": "batch-123",
 		"results": [
@@ -842,26 +671,8 @@ func TestBatch_Interop_RoundTrip(t *testing.T) {
 		]
 	}`
 
-	var batchResponse struct {
-		Results []struct {
-			BatchIndex int                `json:"batch_index"`
-			StatusCode int                `json:"status_code"`
-			Body       stdjson.RawMessage `json:"body"`
-		} `json:"results"`
-	}
-	stdjson.Unmarshal([]byte(pythonResponse), &batchResponse)
-
-	// Step 4: Demux response
-	for _, r := range batchResponse.Results {
-		if r.BatchIndex >= 0 && r.BatchIndex < len(results) && !results[r.BatchIndex].filled {
-			results[r.BatchIndex] = batchResultItem{
-				BatchIdx:   r.BatchIndex,
-				StatusCode: r.StatusCode,
-				Body:       r.Body,
-				filled:     true,
-			}
-		}
-	}
+	resp := parseBatchResponse(t, pythonResponse)
+	applyDemuxToResults(results, resp)
 
 	// Verify all results are filled correctly
 	assert.True(t, results[0].filled)
@@ -884,20 +695,7 @@ func TestBatch_Interop_AllErrors(t *testing.T) {
 		{TaskId: "task-1", BatchIdx: 1, Error: assert.AnError},
 	}
 
-	results := make([]batchResultItem, len(items))
-	validItems := make([]map[string]interface{}, 0)
-
-	for i, item := range items {
-		if item.Error != nil {
-			errBody, _ := stdjson.Marshal(map[string]interface{}{"error": item.Error.Error()})
-			results[i] = batchResultItem{BatchIdx: i, StatusCode: 400, Body: errBody, filled: true}
-			continue
-		}
-		validItems = append(validItems, map[string]interface{}{
-			"batch_index": item.BatchIdx,
-			"task_id":     item.TaskId,
-		})
-	}
+	results, validItems := processItemsWithErrors(items)
 
 	// No valid items, so no HTTP request would be made
 	assert.Len(t, validItems, 0)

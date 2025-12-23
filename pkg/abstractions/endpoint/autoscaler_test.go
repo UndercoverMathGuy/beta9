@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-
 // Positive: Basic latency autoscaler scales correctly with typical config
 func TestLatencyAwareScaleFunc_Positive_BasicScaling(t *testing.T) {
 	instance := createTestInstance(t, &types.Autoscaler{
@@ -276,6 +275,7 @@ func TestAutoscaler_IdealFlow_BurstTrafficHandling(t *testing.T) {
 		QueueVelocity:     10,
 	}
 	result := latencyAwareEndpointScaleFunc(instance, sample)
+	assert.True(t, result.ResultValid, "Steady: result should be valid")
 	assert.Equal(t, 10, result.DesiredContainers, "Steady: queue-depth scaling")
 
 	// Burst detected via velocity
@@ -285,6 +285,7 @@ func TestAutoscaler_IdealFlow_BurstTrafficHandling(t *testing.T) {
 		QueueVelocity:     50, // Spike!
 	}
 	result = latencyAwareEndpointScaleFunc(instance, sample)
+	assert.True(t, result.ResultValid, "Burst: result should be valid")
 	assert.Equal(t, 10, result.DesiredContainers, "Burst: already at max, can't scale further")
 
 	// Burst subsides
@@ -294,6 +295,7 @@ func TestAutoscaler_IdealFlow_BurstTrafficHandling(t *testing.T) {
 		QueueVelocity:     5,
 	}
 	result = latencyAwareEndpointScaleFunc(instance, sample)
+	assert.True(t, result.ResultValid, "Post-burst: result should be valid")
 	assert.Equal(t, 5, result.DesiredContainers, "Post-burst: scale down to match queue")
 }
 
@@ -672,6 +674,7 @@ func TestLatencyAwareScaleFunc_Interop_AllConstraints(t *testing.T) {
 		LatencyP95Ms:      200,
 	}
 	result := latencyAwareEndpointScaleFunc(instance, sample)
+	assert.True(t, result.ResultValid)
 	assert.Equal(t, 2, result.DesiredContainers, "min floor should override latency scale-up to 1")
 
 	// Case 2: Latency trigger wants to scale from 4 to 5, within bounds
@@ -681,6 +684,7 @@ func TestLatencyAwareScaleFunc_Interop_AllConstraints(t *testing.T) {
 		LatencyP95Ms:      200,
 	}
 	result = latencyAwareEndpointScaleFunc(instance, sample)
+	assert.True(t, result.ResultValid)
 	assert.Equal(t, 5, result.DesiredContainers, "should scale to 5 within bounds")
 
 	// Case 3: Latency trigger wants to scale from 5 to 6, but max is 5
@@ -690,6 +694,7 @@ func TestLatencyAwareScaleFunc_Interop_AllConstraints(t *testing.T) {
 		LatencyP95Ms:      200,
 	}
 	result = latencyAwareEndpointScaleFunc(instance, sample)
+	assert.True(t, result.ResultValid)
 	assert.Equal(t, 5, result.DesiredContainers, "max ceiling should cap at 5")
 }
 

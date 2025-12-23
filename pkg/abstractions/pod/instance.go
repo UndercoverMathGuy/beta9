@@ -45,7 +45,7 @@ func (i *podInstance) startContainers(containersToRun int, useCRIU bool) error {
 		gpuCount = 1
 	}
 
-	checkpointEnabled := i.StubConfig.CheckpointEnabled
+	checkpointEnabled := i.StubConfig.CheckpointEnabled || useCRIU
 	if gpuCount > 1 {
 		checkpointEnabled = false
 	}

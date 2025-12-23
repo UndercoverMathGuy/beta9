@@ -18,6 +18,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog/log"
 
 	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
 	"github.com/beam-cloud/beta9/pkg/common"
@@ -208,11 +209,17 @@ func (rb *RequestBuffer) processBatchRequests() {
 		for len(batch.requests) < batch.maxSize {
 			select {
 			case <-rb.ctx.Done():
+				if timer != nil {
+					timer.Stop()
+				}
 				return
 			case <-timerC:
 				goto dispatch
 			default:
-				if len(rb.availableContainers) == 0 {
+				rb.availableContainersLock.RLock()
+				hasContainers := len(rb.availableContainers) > 0
+				rb.availableContainersLock.RUnlock()
+				if !hasContainers {
 					time.Sleep(requestProcessingInterval)
 					continue
 				}
@@ -223,13 +230,14 @@ func (rb *RequestBuffer) processBatchRequests() {
 					continue
 				}
 
-				if req.ctx.IsWebSocket() {
-					go rb.handleRequest(req)
+				// Check context cancellation before processing any request type
+				if req.ctx.Request().Context().Err() != nil {
+					rb.cancelInFlightTask(req.task, types.TaskRequestCancelled)
 					continue
 				}
 
-				if req.ctx.Request().Context().Err() != nil {
-					rb.cancelInFlightTask(req.task, types.TaskRequestCancelled)
+				if req.ctx.IsWebSocket() {
+					go rb.handleRequest(req)
 					continue
 				}
 				if rb.isASGI {
@@ -506,6 +514,9 @@ func (rb *RequestBuffer) handleBatchRequest(batch *batchBuffer) {
 	c := rb.availableContainers[0]
 	rb.availableContainersLock.RUnlock()
 
+	// NOTE: Batch processing intentionally acquires one token for the entire batch.
+	// This is by design - the batch is processed as a single unit by the container.
+	// Per-request token acquisition would defeat the purpose of batching.
 	err := rb.acquireRequestToken(c.id)
 	if err != nil {
 		for _, req := range batch.requests {
@@ -519,7 +530,7 @@ func (rb *RequestBuffer) handleBatchRequest(batch *batchBuffer) {
 	}
 	done := make(chan struct{})
 	go rb.batchHeartBeat(rb.ctx, batch.batchId, c.id, done)
-	rb.handleBatchHttpRequest(batch, c, batch.batchId)
+	rb.handleBatchHttpRequest(batch, c)
 	close(done)
 	latency := time.Since(start)
 	rb.RecordLatency(latency)
@@ -652,11 +663,9 @@ func (rb *RequestBuffer) handleHttpRequest(req *request, c container) {
 
 		if err != nil {
 			if err != io.EOF && err != context.Canceled {
-				req.ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
-					"error": "Internal server error",
-				})
+				// *! BUG - Used to use req.ctx.JSON; but headers already sent via WriteHeader, can only log the error
+				log.Error().Err(err).Str("task_id", req.task.msg.TaskId).Msg("error streaming response body")
 			}
-
 			break
 		}
 	}
@@ -703,9 +712,19 @@ type batchResultItem struct {
 	filled     bool
 }
 
-func (rb *RequestBuffer) handleBatchHttpRequest(batch *batchBuffer, c container, batchId string) error {
+// fillUnfilledResults fills all unfilled result slots with an error response
+func fillUnfilledResults(results []batchResultItem, statusCode int, errorMsg string) {
+	for i := range results {
+		if !results[i].filled {
+			errBody, _ := json.Marshal(map[string]interface{}{"error": errorMsg})
+			results[i] = batchResultItem{BatchIdx: i, StatusCode: statusCode, Body: errBody, filled: true}
+		}
+	}
+}
+
+func (rb *RequestBuffer) handleBatchHttpRequest(batch *batchBuffer, c container) error {
 	items, _ := rb.parseBatchItems(*batch)
-	batchId = batch.batchId
+	batchId := batch.batchId
 	results := make([]batchResultItem, len(batch.requests))
 
 	validItems := make([]map[string]interface{}, 0)
@@ -738,25 +757,13 @@ func (rb *RequestBuffer) handleBatchHttpRequest(batch *batchBuffer, c container,
 		}
 		batchPayloadBytes, err := json.Marshal(batchPayload)
 		if err != nil {
-			// Write 500 to all unfilled results (same as handleHttpRequest line 510)
-			for i := range results {
-				if !results[i].filled {
-					errBody, _ := json.Marshal(map[string]interface{}{"error": "Internal server error"})
-					results[i] = batchResultItem{BatchIdx: i, StatusCode: http.StatusInternalServerError, Body: errBody, filled: true}
-				}
-			}
+			fillUnfilledResults(results, http.StatusInternalServerError, "Internal server error")
 			goto demux
 		}
 
 		httpClient, err := rb.getHttpClient(c.address, handleHttpRequestClientTimeout)
 		if err != nil {
-			// Write 500 to all unfilled results (same as handleHttpRequest line 521)
-			for i := range results {
-				if !results[i].filled {
-					errBody, _ := json.Marshal(map[string]interface{}{"error": "Internal server error"})
-					results[i] = batchResultItem{BatchIdx: i, StatusCode: http.StatusInternalServerError, Body: errBody, filled: true}
-				}
-			}
+			fillUnfilledResults(results, http.StatusInternalServerError, "Internal server error")
 			goto demux
 		}
 
@@ -767,13 +774,7 @@ func (rb *RequestBuffer) handleBatchHttpRequest(batch *batchBuffer, c container,
 
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", containerUrl, bytes.NewReader(batchPayloadBytes))
 		if err != nil {
-			// Write 500 to all unfilled results (same as handleHttpRequest line 538)
-			for i := range results {
-				if !results[i].filled {
-					errBody, _ := json.Marshal(map[string]interface{}{"error": "Internal server error"})
-					results[i] = batchResultItem{BatchIdx: i, StatusCode: http.StatusInternalServerError, Body: errBody, filled: true}
-				}
-			}
+			fillUnfilledResults(results, http.StatusInternalServerError, "Internal server error")
 			goto demux
 		}
 
@@ -781,9 +782,13 @@ func (rb *RequestBuffer) handleBatchHttpRequest(batch *batchBuffer, c container,
 		httpReq.Header.Set("X-BATCH-ID", batchId)
 
 		// Copy headers from first request (same as handleHttpRequest line 544-548)
+		// Skip Content-Type and Content-Length to avoid duplicating headers set by batch request
 		if len(batch.requests) > 0 {
 			firstReq := batch.requests[0].ctx.Request()
 			for key, values := range firstReq.Header {
+				if strings.EqualFold(key, "Content-Type") || strings.EqualFold(key, "Content-Length") {
+					continue
+				}
 				for _, val := range values {
 					httpReq.Header.Add(key, val)
 				}
@@ -798,13 +803,7 @@ func (rb *RequestBuffer) handleBatchHttpRequest(batch *batchBuffer, c container,
 					rb.cancelInFlightTask(req.task, types.TaskRequestCancelled)
 				}
 			}
-			// Write 500 to all unfilled results
-			for i := range results {
-				if !results[i].filled {
-					errBody, _ := json.Marshal(map[string]interface{}{"error": "Internal server error"})
-					results[i] = batchResultItem{BatchIdx: i, StatusCode: http.StatusInternalServerError, Body: errBody, filled: true}
-				}
-			}
+			fillUnfilledResults(results, http.StatusInternalServerError, "Internal server error")
 			goto demux
 		}
 		defer resp.Body.Close()
@@ -819,13 +818,7 @@ func (rb *RequestBuffer) handleBatchHttpRequest(batch *batchBuffer, c container,
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&batchResponse); err != nil {
-			// Write 500 to all unfilled results
-			for i := range results {
-				if !results[i].filled {
-					errBody, _ := json.Marshal(map[string]interface{}{"error": "Internal server error"})
-					results[i] = batchResultItem{BatchIdx: i, StatusCode: http.StatusInternalServerError, Body: errBody, filled: true}
-				}
-			}
+			fillUnfilledResults(results, http.StatusInternalServerError, "Internal server error")
 			goto demux
 		}
 
@@ -900,9 +893,8 @@ demux:
 			}
 			if err != nil {
 				if err != io.EOF && err != context.Canceled {
-					req.ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
-						"error": "Internal server error",
-					})
+					// Headers already sent via WriteHeader, can only log the error
+					log.Error().Err(err).Str("task_id", req.task.msg.TaskId).Msg("error writing batch response body")
 				}
 				break
 			}

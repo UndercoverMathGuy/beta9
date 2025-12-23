@@ -66,7 +66,7 @@ func (i *endpointInstance) startContainers(containersToRun int, useCRIU bool) er
 		gpuCount = 1
 	}
 
-	checkpointEnabled := i.StubConfig.CheckpointEnabled
+	checkpointEnabled := i.StubConfig.CheckpointEnabled || useCRIU
 
 	if gpuCount > 1 {
 		checkpointEnabled = false
@@ -101,7 +101,7 @@ func (i *endpointInstance) startContainers(containersToRun int, useCRIU bool) er
 			EntryPoint:        i.EntryPoint,
 			Mounts:            mounts,
 			Stub:              *i.Stub,
-			CheckpointEnabled: checkpointEnabled || useCRIU,
+			CheckpointEnabled: checkpointEnabled,
 			Preemptable:       true,
 		}
 

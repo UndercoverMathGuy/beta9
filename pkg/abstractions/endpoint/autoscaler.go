@@ -59,12 +59,28 @@ func endpointLatencySampleFunc(i *endpointInstance) (*endpointAutoscalerSample, 
 	return baseSample, nil
 }
 
+// isInvalidSample checks if the autoscaler sample contains error states
+func isInvalidSample(s *endpointAutoscalerSample) bool {
+	return s.TotalRequests == -1 || s.CurrentContainers == -1
+}
+
+// invalidAutoscalerResult returns a result indicating invalid sample data
+func invalidAutoscalerResult() *abstractions.AutoscalerResult {
+	return &abstractions.AutoscalerResult{ResultValid: false}
+}
+
+// calculateMaxReplicas computes the effective max replicas from autoscaler config and gateway limits
+func calculateMaxReplicas(i *endpointInstance) int {
+	maxContainers := uint(1)
+	if i.StubConfig.Autoscaler != nil && i.StubConfig.Autoscaler.MaxContainers > 0 {
+		maxContainers = i.StubConfig.Autoscaler.MaxContainers
+	}
+	return int(math.Min(float64(maxContainers), float64(i.AppConfig.GatewayService.StubLimits.MaxReplicas)))
+}
+
 func endpointDeploymentScaleFunc(i *endpointInstance, s *endpointAutoscalerSample) *abstractions.AutoscalerResult {
-	// Check for error states in sample
-	if s.TotalRequests == -1 || s.CurrentContainers == -1 {
-		return &abstractions.AutoscalerResult{
-			ResultValid: false,
-		}
+	if isInvalidSample(s) {
+		return invalidAutoscalerResult()
 	}
 
 	desiredContainers := 0
@@ -83,21 +99,22 @@ func endpointDeploymentScaleFunc(i *endpointInstance, s *endpointAutoscalerSampl
 			desiredContainers += 1
 		}
 
-		maxContainers := uint(1)
-		if i.StubConfig.Autoscaler != nil {
-			maxContainers = i.StubConfig.Autoscaler.MaxContainers
+		maxReplicas := calculateMaxReplicas(i)
+		if desiredContainers > maxReplicas {
+			desiredContainers = maxReplicas
 		}
-
-		// Limit max replicas to either what was set in autoscaler config, or the limit specified on the gateway config (whichever is lower)
-		maxReplicas := math.Min(float64(maxContainers), float64(i.AppConfig.GatewayService.StubLimits.MaxReplicas))
-		desiredContainers = int(math.Min(maxReplicas, float64(desiredContainers)))
 	}
 
-	// Enforce MinContainers floor
+	// Enforce MinContainers floor, but cap at maxReplicas to ensure hard limits are respected
 	if i.StubConfig.Autoscaler != nil && i.StubConfig.Autoscaler.MinContainers > 0 {
 		minContainers := int(i.StubConfig.Autoscaler.MinContainers)
 		if desiredContainers < minContainers {
 			desiredContainers = minContainers
+		}
+		// Re-apply max ceiling in case MinContainers > MaxReplicas (config error, but respect hard limit)
+		maxReplicas := calculateMaxReplicas(i)
+		if desiredContainers > maxReplicas {
+			desiredContainers = maxReplicas
 		}
 	}
 
@@ -108,11 +125,8 @@ func endpointDeploymentScaleFunc(i *endpointInstance, s *endpointAutoscalerSampl
 }
 
 func latencyAwareEndpointScaleFunc(i *endpointInstance, s *endpointAutoscalerSample) *abstractions.AutoscalerResult {
-	// Check for error states in sample
-	if s.TotalRequests == -1 || s.CurrentContainers == -1 {
-		return &abstractions.AutoscalerResult{
-			ResultValid: false,
-		}
+	if isInvalidSample(s) {
+		return invalidAutoscalerResult()
 	}
 
 	autoscaler := i.StubConfig.Autoscaler
@@ -121,11 +135,7 @@ func latencyAwareEndpointScaleFunc(i *endpointInstance, s *endpointAutoscalerSam
 	}
 
 	// Calculate max allowed containers
-	maxContainers := int(autoscaler.MaxContainers)
-	if maxContainers == 0 {
-		maxContainers = 1
-	}
-	maxReplicas := int(math.Min(float64(maxContainers), float64(i.AppConfig.GatewayService.StubLimits.MaxReplicas)))
+	maxReplicas := calculateMaxReplicas(i)
 
 	// Calculate min containers floor
 	minContainers := int(autoscaler.MinContainers)
@@ -141,18 +151,11 @@ func latencyAwareEndpointScaleFunc(i *endpointInstance, s *endpointAutoscalerSam
 		return desired
 	}
 
-	// Latency trigger: scale up if p95 exceeds threshold
-	if autoscaler.LatencyThreshold > 0 && s.LatencyP95Ms > float64(autoscaler.LatencyThreshold) {
-		desiredContainers := clampContainers(int(s.CurrentContainers) + 1)
-		return &abstractions.AutoscalerResult{
-			DesiredContainers: desiredContainers,
-			ResultValid:       true,
-			CRIUScaling:       autoscaler.EnableCRIUScaling && s.CheckpointReady,
-		}
-	}
+	// Scale up if latency p95 exceeds threshold OR queue velocity exceeds threshold
+	shouldScaleUp := (autoscaler.LatencyThreshold > 0 && s.LatencyP95Ms > float64(autoscaler.LatencyThreshold)) ||
+		(autoscaler.QueueVelocity > 0 && s.QueueVelocity > float64(autoscaler.QueueVelocity))
 
-	// Queue velocity trigger: scale up if velocity exceeds threshold
-	if autoscaler.QueueVelocity > 0 && s.QueueVelocity > float64(autoscaler.QueueVelocity) {
+	if shouldScaleUp {
 		desiredContainers := clampContainers(int(s.CurrentContainers) + 1)
 		return &abstractions.AutoscalerResult{
 			DesiredContainers: desiredContainers,

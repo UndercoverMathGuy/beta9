@@ -4,6 +4,8 @@ import (
 	"context"
 	"sort"
 	"strconv"
+
+	"github.com/redis/go-redis/v9"
 )
 
 type LatencyMetrics struct {
@@ -53,9 +55,13 @@ func (rb *RequestBuffer) GetLatencyMetrics(ctx context.Context, workspaceName st
 
 	velocityKey := Keys.endpointQueueVelocity(workspaceName, stubId)
 	velocity, err := rb.rdb.Get(ctx, velocityKey).Float64()
-	if err == nil {
-		metrics.QueueVelocity = velocity
+	if err != nil {
+		if err == redis.Nil {
+			return metrics, nil
+		}
+		return metrics, err
 	}
+	metrics.QueueVelocity = velocity
 
 	return metrics, nil
 }
