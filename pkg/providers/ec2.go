@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -16,6 +18,10 @@ import (
 	"github.com/beam-cloud/beta9/pkg/types"
 )
 
+// CRITICAL FIX #12: Regex for sanitizing placement group names
+// AWS requires: alphanumeric, hyphens, and underscores only, max 255 chars
+var placementGroupNameRegex = regexp.MustCompile(`[^a-zA-Z0-9\-_]`)
+
 type EC2Provider struct {
 	*ExternalProvider
 	client         *ec2.Client
@@ -26,6 +32,11 @@ func NewEC2Provider(ctx context.Context, appConfig types.AppConfig, providerRepo
 	cfg, err := common.GetAWSConfig(appConfig.Providers.EC2.AWSAccessKey, appConfig.Providers.EC2.AWSSecretKey, appConfig.Providers.EC2.AWSRegion, "")
 	if err != nil {
 		return nil, err
+	}
+
+	// P1 Fix: Validate SubnetId is configured to prevent nil pointer dereference
+	if appConfig.Providers.EC2.SubnetId == nil || *appConfig.Providers.EC2.SubnetId == "" {
+		return nil, errors.New("EC2 provider requires SubnetId to be configured")
 	}
 
 	ec2Provider := &EC2Provider{
@@ -121,7 +132,47 @@ func (p *EC2Provider) ProvisionMachine(ctx context.Context, poolName, token stri
 		MinCount:     aws.Int32(1),
 		MaxCount:     aws.Int32(1),
 		UserData:     aws.String(cloudInitData),
-		SubnetId:     p.providerConfig.SubnetId,
+	}
+
+	// ** Additions for colo and EFA
+	// P1 Fix: Use sanitized placement group name returned from ensurePlacementGroup
+	var placementGroupName string
+	if compute.PlacementGroupName != "" {
+		pgName, err := p.ensurePlacementGroup(ctx, compute.PlacementGroupName)
+		if err != nil {
+			return "", fmt.Errorf("Failed to ensure placement group: %w", err)
+		}
+		placementGroupName = pgName
+		input.Placement = &awsTypes.Placement{
+			GroupName: aws.String(placementGroupName),
+		}
+		log.Info().Str("Provider", p.Name).Str("placement_group", placementGroupName).Msg("Using placement group for co-location")
+	}
+
+	if compute.EnableEFA {
+		if !p.isEFASupported(instance.Type) {
+			return "", fmt.Errorf("Instance type %s does not support EFA", instance.Type)
+		}
+		sgName := fmt.Sprintf("%s-cluster-sg", p.ClusterName)
+		sgId, err := p.ensureClusterSecurityGroup(ctx, sgName)
+		if err != nil {
+			return "", fmt.Errorf("Failed to ensure cluster security group: %w", err)
+		}
+		// When using NetworkInterfaces, SubnetId must be in the interface spec, not top-level
+		input.NetworkInterfaces = []awsTypes.InstanceNetworkInterfaceSpecification{
+			{
+				DeviceIndex:              aws.Int32(0),
+				SubnetId:                 p.providerConfig.SubnetId,
+				Groups:                   []string{sgId},
+				AssociatePublicIpAddress: aws.Bool(true),
+				DeleteOnTermination:      aws.Bool(true),
+				InterfaceType:            aws.String("efa"),
+			},
+		}
+		log.Info().Str("Provider", p.Name).Str("instance_type", instance.Type).Msg("EFA network interface enabled")
+	} else {
+		// Standard provisioning without EFA
+		input.SubnetId = p.providerConfig.SubnetId
 	}
 
 	result, err := p.client.RunInstances(ctx, input)
@@ -244,6 +295,162 @@ func (p *EC2Provider) listMachines(ctx context.Context, poolName string) (map[st
 	}
 
 	return machines, nil
+}
+
+// sanitizePlacementGroupName ensures the placement group name is valid for AWS
+// CRITICAL FIX #12: AWS requires alphanumeric, hyphens, and underscores only, max 255 chars
+func sanitizePlacementGroupName(name string) string {
+	// Replace invalid characters with hyphens
+	sanitized := placementGroupNameRegex.ReplaceAllString(name, "-")
+	// Remove consecutive hyphens
+	for strings.Contains(sanitized, "--") {
+		sanitized = strings.ReplaceAll(sanitized, "--", "-")
+	}
+	// Trim leading/trailing hyphens
+	sanitized = strings.Trim(sanitized, "-")
+	// Truncate to max 255 chars
+	if len(sanitized) > 255 {
+		sanitized = sanitized[:255]
+	}
+	// Ensure non-empty
+	if sanitized == "" {
+		sanitized = "beta9-pg"
+	}
+	return sanitized
+}
+
+// Creates Placement Group with colo
+// P1 Fix: Return sanitized name to use consistently in ProvisionMachine
+func (p *EC2Provider) ensurePlacementGroup(ctx context.Context, groupName string) (string, error) {
+	// P1 Fix: Sanitize placement group name before use
+	sanitizedName := sanitizePlacementGroupName(groupName)
+	if sanitizedName != groupName {
+		log.Warn().
+			Str("original", groupName).
+			Str("sanitized", sanitizedName).
+			Msg("Placement group name was sanitized")
+	}
+
+	describeInput := &ec2.DescribePlacementGroupsInput{
+		GroupNames: []string{sanitizedName},
+	}
+	_, err := p.client.DescribePlacementGroups(ctx, describeInput)
+	if err == nil {
+		return sanitizedName, nil
+	}
+
+	createInput := &ec2.CreatePlacementGroupInput{
+		GroupName: aws.String(sanitizedName),
+		Strategy:  awsTypes.PlacementStrategyCluster,
+		TagSpecifications: []awsTypes.TagSpecification{
+			{
+				ResourceType: awsTypes.ResourceTypePlacementGroup,
+				Tags: []awsTypes.Tag{
+					{Key: aws.String("Beta9ClusterName"), Value: aws.String(p.ClusterName)},
+					{Key: aws.String("Name"), Value: aws.String(sanitizedName)},
+				},
+			},
+		},
+	}
+
+	_, err = p.client.CreatePlacementGroup(ctx, createInput)
+	if err != nil {
+		return "", fmt.Errorf("Failed to create placement group %s: %w", sanitizedName, err)
+	}
+
+	log.Info().Str("Provider", p.Name).Str("placement_group", sanitizedName).Msg("Created placement group")
+	return sanitizedName, nil
+}
+
+func (p *EC2Provider) ensureClusterSecurityGroup(ctx context.Context, groupName string) (string, error) {
+	describeInput := &ec2.DescribeSecurityGroupsInput{
+		Filters: []awsTypes.Filter{
+			{Name: aws.String("group-name"), Values: []string{groupName}},
+			{Name: aws.String("tag:Beta9ClusterName"), Values: []string{p.ClusterName}},
+		},
+	}
+	// P2 Fix: Return error when DescribeSecurityGroups fails instead of ignoring it
+	result, err := p.client.DescribeSecurityGroups(ctx, describeInput)
+	if err != nil {
+		return "", fmt.Errorf("failed to describe security groups: %w", err)
+	}
+	if len(result.SecurityGroups) > 0 {
+		return *result.SecurityGroups[0].GroupId, nil
+	}
+
+	subnetResult, err := p.client.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
+		SubnetIds: []string{*p.providerConfig.SubnetId},
+	})
+	if err != nil || len(subnetResult.Subnets) == 0 {
+		return "", fmt.Errorf("Failed to get subnet VPC: %w", err)
+	}
+	vpcId := *subnetResult.Subnets[0].VpcId
+
+	createResult, err := p.client.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{
+		GroupName:   aws.String(groupName),
+		Description: aws.String("Beta9 cluster EFA traffic - auto-created"),
+		VpcId:       aws.String(vpcId),
+		TagSpecifications: []awsTypes.TagSpecification{{
+			ResourceType: awsTypes.ResourceTypeSecurityGroup,
+			Tags: []awsTypes.Tag{
+				{Key: aws.String("Beta9ClusterName"), Value: aws.String(p.ClusterName)},
+				{Key: aws.String("Name"), Value: aws.String(groupName)},
+			},
+		}},
+	})
+	if err != nil {
+		return "", fmt.Errorf("Failed to create security group: %w", err)
+	}
+	sgId := *createResult.GroupId
+
+	_, err = p.client.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
+		GroupId: aws.String(sgId),
+		IpPermissions: []awsTypes.IpPermission{{
+			IpProtocol: aws.String("-1"),
+			UserIdGroupPairs: []awsTypes.UserIdGroupPair{{
+				GroupId: aws.String(sgId),
+			}},
+		}},
+	})
+	if err != nil {
+		// P2 Fix: Rollback - delete security group if ingress authorization fails
+		_, deleteErr := p.client.DeleteSecurityGroup(ctx, &ec2.DeleteSecurityGroupInput{
+			GroupId: aws.String(sgId),
+		})
+		if deleteErr != nil {
+			log.Error().Err(deleteErr).Str("security_group_id", sgId).
+				Msg("Failed to delete security group after ingress authorization failure")
+		}
+		return "", fmt.Errorf("Failed to authorize security group ingress: %w", err)
+	}
+	log.Info().Str("Provider", p.Name).Str("security_group", sgId).Msg("Created cluster security group")
+	return sgId, nil
+}
+
+// isEFASupported checks if the instance type supports Elastic Fabric Adapter
+// See: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa.html#efa-instance-types
+func (p *EC2Provider) isEFASupported(instanceType string) bool {
+	efaSupportedPrefixes := []string{
+		"p4d", "p4de", "p5", "p5e", // GPU instances (A100, H100)
+		"trn1", "trn1n", "trn2", // Trainium instances
+		"inf2",                              // Inferentia instances
+		"hpc6a", "hpc6id", "hpc7a", "hpc7g", // HPC instances
+		"c5n", "c6a", "c6gn", "c6i", "c6in", "c7g", "c7gn", "c7i", // Compute optimized
+		"m5dn", "m5n", "m5zn", "m6a", "m6i", "m6idn", "m6in", "m7a", "m7g", "m7i", // General purpose
+		"r5dn", "r5n", "r6a", "r6i", "r6idn", "r6in", "r7a", "r7g", "r7i", "r7iz", // Memory optimized
+		"dl1", "dl2q", // Deep learning instances
+		"g4dn", "g5", "g6", // Graphics instances
+		"i3en", "i4g", "i4i", // Storage optimized
+		"im4gn", "is4gen", // Storage optimized
+		"x2idn", "x2iedn", "x2iezn", // Memory optimized
+	}
+
+	for _, prefix := range efaSupportedPrefixes {
+		if len(instanceType) >= len(prefix) && instanceType[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return false
 }
 
 const ec2UserDataTemplate string = `#!/bin/bash

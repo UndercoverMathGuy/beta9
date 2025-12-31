@@ -132,6 +132,10 @@ func (wpc *LocalWorkerPoolControllerForTest) AddWorkerToMachine(cpu int64, memor
 	return nil, errors.New("unimplemented")
 }
 
+func (wpc *LocalWorkerPoolControllerForTest) AddWorkerGroup (request *types.GangRequest) ([]*types.Worker, error) {
+	return nil, errors.New("unimplemented")
+}
+
 func (wpc *LocalWorkerPoolControllerForTest) Name() string {
 	return wpc.name
 }
@@ -197,6 +201,10 @@ func (wpc *ExternalWorkerPoolControllerForTest) AddWorker(cpu int64, memory int6
 	}
 
 	return worker, nil
+}
+
+func (wpc *ExternalWorkerPoolControllerForTest) AddWorkerGroup(request *types.GangRequest) ([]*types.Worker, error) {
+	return nil, errors.New("unimplemented")
 }
 
 func (wpc *ExternalWorkerPoolControllerForTest) AddWorkerToMachine(cpu int64, memory int64, gpuType string, gpuCount uint32, machineId string) (*types.Worker, error) {

@@ -2,6 +2,7 @@ package abstractions
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -14,6 +15,7 @@ type AutoscalerResult struct {
 type Autoscaler[I IAutoscaledInstance, S AutoscalerSample] struct {
 	instance         I
 	mostRecentSample S
+	sampleLock       sync.RWMutex // HIGH FIX #13: Protect mostRecentSample access
 	sampleFunc       func(I) (S, error)
 	scaleFunc        func(I, S) *AutoscalerResult
 }
@@ -52,7 +54,10 @@ func (as *Autoscaler[I, S]) Start(ctx context.Context) {
 				continue
 			}
 
+			// HIGH FIX #13: Protect mostRecentSample write with lock
+			as.sampleLock.Lock()
 			as.mostRecentSample = sample
+			as.sampleLock.Unlock()
 
 			scaleResult := as.scaleFunc(as.instance, sample)
 			if scaleResult != nil && scaleResult.ResultValid {
@@ -60,4 +65,11 @@ func (as *Autoscaler[I, S]) Start(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// GetMostRecentSample returns the most recent sample in a thread-safe manner
+func (as *Autoscaler[I, S]) GetMostRecentSample() S {
+	as.sampleLock.RLock()
+	defer as.sampleLock.RUnlock()
+	return as.mostRecentSample
 }

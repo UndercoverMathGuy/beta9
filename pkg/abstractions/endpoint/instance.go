@@ -138,7 +138,9 @@ func (i *endpointInstance) stopContainers(containersToStop int) error {
 		idx := rnd.Intn(len(containerIds))
 		containerId := containerIds[idx]
 
-		err := i.Scheduler.Stop(&types.StopContainerArgs{ContainerId: containerId, Reason: types.StopContainerReasonScheduler})
+		// CRITICAL FIX #8: Use Force: true for consistency with pod abstraction
+		// This ensures containers are stopped even if they have in-flight requests
+		err := i.Scheduler.Stop(&types.StopContainerArgs{ContainerId: containerId, Force: true, Reason: types.StopContainerReasonScheduler})
 		if err != nil {
 			log.Error().Str("instance_name", i.Name).Err(err).Msg("unable to stop container")
 			return err

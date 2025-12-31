@@ -7,6 +7,8 @@ package function;
 service FunctionService {
   rpc FunctionInvoke(FunctionInvokeRequest)
       returns (stream FunctionInvokeResponse) {}
+  rpc FunctionInvokeGang(FunctionInvokeGangRequest)
+      returns (stream FunctionInvokeGangResponse) {}
   rpc FunctionGetArgs(FunctionGetArgsRequest)
       returns (FunctionGetArgsResponse) {}
   rpc FunctionSetResult(FunctionSetResultRequest)
@@ -67,4 +69,21 @@ message FunctionScheduleResponse {
   bool ok = 1;
   string err_msg = 2;
   string scheduled_job_id = 3;
+}
+
+message FunctionInvokeGangRequest {
+  string stub_id = 1;
+  bytes args = 2;
+  bool headless = 3;
+  int32 nodes = 4;
+  bool enable_efa = 5;
+  string placement_group = 6;
+}
+
+message FunctionInvokeGangResponse {
+  string group_id = 1;
+  string output = 2;
+  bool done = 3;
+  int32 exit_code = 4;
+  bytes result = 5;
 }

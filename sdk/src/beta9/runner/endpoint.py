@@ -289,9 +289,53 @@ class EndpointManager:
             """
             gateway_stub = request.app.state.gateway_stub
 
-            batch_payload = await request.json()
-            batch_id = batch_payload["batch_id"]
-            items = batch_payload["items"]
+            # CRITICAL FIX #7: Validate batch payload structure
+            try:
+                batch_payload = await request.json()
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"Invalid JSON payload: {str(e)}"},
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+
+            # Validate required fields
+            if not isinstance(batch_payload, dict):
+                return JSONResponse(
+                    {"error": "Batch payload must be a JSON object"},
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+
+            batch_id = batch_payload.get("batch_id")
+            if not batch_id or not isinstance(batch_id, str):
+                return JSONResponse(
+                    {"error": "Missing or invalid 'batch_id' field"},
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+
+            items = batch_payload.get("items")
+            if not items or not isinstance(items, list):
+                return JSONResponse(
+                    {"error": "Missing or invalid 'items' field - must be a non-empty list"},
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+
+            # Validate each item has required fields
+            for idx, item in enumerate(items):
+                if not isinstance(item, dict):
+                    return JSONResponse(
+                        {"error": f"Item at index {idx} must be a JSON object"},
+                        status_code=HTTPStatus.BAD_REQUEST,
+                    )
+                if "task_id" not in item:
+                    return JSONResponse(
+                        {"error": f"Item at index {idx} missing 'task_id' field"},
+                        status_code=HTTPStatus.BAD_REQUEST,
+                    )
+                if "payload" not in item:
+                    return JSONResponse(
+                        {"error": f"Item at index {idx} missing 'payload' field"},
+                        status_code=HTTPStatus.BAD_REQUEST,
+                    )
 
             # Extract batch_index for proper demuxing (Go may skip failed items)
             batch_indices = [item.get("batch_index", i) for i, item in enumerate(items)]
@@ -305,23 +349,26 @@ class EndpointManager:
                 ))
 
             start_time = time.time()
-                
+
             results, errors = await self._call_batch_function(batch_id, task_ids, payloads)
-            duration = time.time() - start_time
+            total_duration = time.time() - start_time
+            # HIGH FIX #18: Calculate per-task duration as total / batch_size
+            # This provides a more accurate per-task duration for billing/metrics
+            per_task_duration = total_duration / len(task_ids) if task_ids else 0
 
             for idx, task_id in enumerate(task_ids):
                 status = TaskStatus.Error if errors[idx] else TaskStatus.Complete
                 end_task_and_send_callback(
-                    gateway_stub = gateway_stub,
-                    payload = results[idx],
-                    end_task_request = EndTaskRequest(
+                    gateway_stub=gateway_stub,
+                    payload=results[idx],
+                    end_task_request=EndTaskRequest(
                         task_id=task_id,
-                        container_id = cfg.container_id,
-                        keep_warm_seconds = cfg.keep_warm_seconds,
-                        task_status = status,
-                        task_duration = duration,
+                        container_id=cfg.container_id,
+                        keep_warm_seconds=cfg.keep_warm_seconds,
+                        task_status=status,
+                        task_duration=per_task_duration,
                     ),
-                    override_callback_url = None,
+                    override_callback_url=None,
                 )
 
             return JSONResponse(

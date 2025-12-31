@@ -229,6 +229,129 @@ func (wpc *ExternalWorkerPoolController) AddWorkerToMachine(cpu int64, memory in
 	return worker, nil
 }
 
+func (wpc *ExternalWorkerPoolController) AddWorkerGroup(request *types.GangRequest) ([]*types.Worker, error) {
+	if len(request.ContainerRequests) == 0 {
+		return nil, errors.New("Gang Requests: No container requests")
+	}
+
+	// Validate homogeneous specs across all ContainerRequests
+	// Gang scheduling requires all nodes to have identical resource specifications
+	spec := request.ContainerRequests[0]
+	for i := 1; i < len(request.ContainerRequests); i++ {
+		req := request.ContainerRequests[i]
+		if req.Cpu != spec.Cpu {
+			return nil, fmt.Errorf("gang request: heterogeneous CPU specs not supported (node 0: %d, node %d: %d)", spec.Cpu, i, req.Cpu)
+		}
+		if req.Memory != spec.Memory {
+			return nil, fmt.Errorf("gang request: heterogeneous memory specs not supported (node 0: %d, node %d: %d)", spec.Memory, i, req.Memory)
+		}
+		if req.GpuCount != spec.GpuCount {
+			return nil, fmt.Errorf("gang request: heterogeneous GPU count not supported (node 0: %d, node %d: %d)", spec.GpuCount, i, req.GpuCount)
+		}
+	}
+
+	workers := make([]*types.Worker, 0, request.NodeCount)
+	machineIds := make([]string, 0, request.NodeCount)
+
+	// P2 Fix: Use deferred cleanup with success flag to eliminate duplicated cleanup loops
+	var success bool
+	defer func() {
+		if !success {
+			wpc.cleanupMachines(machineIds, "worker group creation failed")
+		}
+	}()
+
+	adminWorkspace, err := wpc.backendRepo.GetAdminWorkspace(wpc.ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate unique token per machine for security isolation
+	for i := 0; i < request.NodeCount; i++ {
+		token, err := wpc.backendRepo.CreateToken(wpc.ctx, adminWorkspace.Id, types.TokenTypeMachine, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create token for node %d/%d: %w", i+1, request.NodeCount, err)
+		}
+		machineId, err := wpc.provider.ProvisionMachine(wpc.ctx, wpc.name, token.Key, types.ProviderComputeRequest{
+			Cpu:                spec.Cpu,
+			Memory:             spec.Memory,
+			Gpu:                wpc.workerPoolConfig.GPUType,
+			GpuCount:           spec.GpuCount,
+			PlacementGroupName: request.PlacementGroup,
+			EnableEFA:          request.EnableEFA,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("Failed to provision node %d/%d: %w", i+1, request.NodeCount, err)
+		}
+		machineIds = append(machineIds, machineId)
+	}
+
+	// Acquire all machine locks first, then defer release of all locks
+	for _, machineId := range machineIds {
+		if err := wpc.providerRepo.SetMachineLock(string(*wpc.providerName), wpc.name, machineId); err != nil {
+			log.Warn().Err(err).Str("machine_id", machineId).Msg("Failed to acquire machine lock")
+		}
+	}
+	defer func() {
+		for _, machineId := range machineIds {
+			wpc.providerRepo.RemoveMachineLock(string(*wpc.providerName), wpc.name, machineId)
+		}
+	}()
+
+	for i, machineId := range machineIds {
+		machineState, err := wpc.providerRepo.WaitForMachineRegistration(string(*wpc.providerName), wpc.name, machineId)
+		if err != nil {
+			return nil, fmt.Errorf("Machine %d/%d failed to register: %w", i+1, request.NodeCount, err)
+		}
+
+		worker, err := wpc.createWorkerOnMachine(
+			GenerateWorkerId(),
+			machineId,
+			machineState,
+			machineState.Cpu,
+			machineState.Memory,
+			wpc.workerPoolConfig.GPUType,
+			machineState.GpuCount,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to create worker on machine %d/%d: %w", i+1, request.NodeCount, err)
+		}
+		workers = append(workers, worker)
+	}
+
+	log.Info().
+		Str("Pool", wpc.name).
+		Int("node_count", request.NodeCount).
+		Str("placement_group", request.PlacementGroup).
+		Bool("EFA", request.EnableEFA).
+		Msg("Gang Provisioned Successfully")
+
+	success = true
+	return workers, nil
+}
+
+// P2 Fix: Helper function to cleanup machines with proper error logging
+func (wpc *ExternalWorkerPoolController) cleanupMachines(machineIds []string, reason string) {
+	if len(machineIds) == 0 {
+		return
+	}
+
+	log.Warn().
+		Str("pool", wpc.name).
+		Int("machine_count", len(machineIds)).
+		Str("reason", reason).
+		Msg("Cleaning up machines due to error")
+
+	for _, machineId := range machineIds {
+		if err := wpc.provider.TerminateMachine(wpc.ctx, wpc.name, machineId, machineId); err != nil {
+			log.Error().
+				Err(err).
+				Str("machine_id", machineId).
+				Msg("Failed to terminate machine during cleanup")
+		}
+	}
+}
+
 func (wpc *ExternalWorkerPoolController) attemptToAssignWorkerToMachine(workerId string, cpu int64, memory int64, gpuType string, gpuCount uint32, machine *types.ProviderMachine) (*types.Worker, error) {
 	err := wpc.providerRepo.SetMachineLock(wpc.provider.GetName(), wpc.name, machine.State.MachineId)
 	if err != nil {

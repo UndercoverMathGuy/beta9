@@ -145,7 +145,7 @@ class Endpoint(RunnerAbstraction):
         on_deploy: Optional[AbstractCallableWrapper] = None,
         volumes: Optional[List[Union[Volume, CloudBucket]]] = None,
         secrets: Optional[List[str]] = None,
-        env: Optional[Dict[str, str]] = {},
+        env: Optional[Dict[str, str]] = None,  # HIGH FIX #15: Mutable default argument
         name: Optional[str] = None,
         authorized: bool = True,
         autoscaler: Autoscaler = QueueDepthAutoscaler(),
@@ -157,6 +157,9 @@ class Endpoint(RunnerAbstraction):
         outputs: Optional[Schema] = None,
         batch: Optional[Batch] = None,
     ):
+        # HIGH FIX #15: Handle None default for mutable argument
+        if env is None:
+            env = {}
         super().__init__(
             cpu=cpu,
             memory=memory,
@@ -314,7 +317,7 @@ class ASGI(Endpoint):
         on_deploy: Optional[AbstractCallableWrapper] = None,
         volumes: Optional[List[Union[Volume, CloudBucket]]] = None,
         secrets: Optional[List[str]] = None,
-        env: Optional[Dict[str, str]] = {},
+        env: Optional[Dict[str, str]] = None,  # HIGH FIX #15: Mutable default argument
         name: Optional[str] = None,
         authorized: bool = True,
         autoscaler: Autoscaler = QueueDepthAutoscaler(),
@@ -322,6 +325,9 @@ class ASGI(Endpoint):
         checkpoint_enabled: bool = False,
         pricing: Optional[PricingPolicy] = None,
     ):
+        # HIGH FIX #15: Handle None default for mutable argument
+        if env is None:
+            env = {}
         self.concurrent_requests = concurrent_requests
         super().__init__(
             cpu=cpu,
@@ -452,7 +458,7 @@ class RealtimeASGI(ASGI):
         on_deploy: Optional[AbstractCallableWrapper] = None,
         volumes: Optional[List[Union[Volume, CloudBucket]]] = None,
         secrets: Optional[List[str]] = None,
-        env: Optional[Dict[str, str]] = {},
+        env: Optional[Dict[str, str]] = None,  # HIGH FIX #15: Mutable default argument
         name: Optional[str] = None,
         authorized: bool = True,
         autoscaler: Autoscaler = QueueDepthAutoscaler(),
@@ -460,6 +466,9 @@ class RealtimeASGI(ASGI):
         checkpoint_enabled: bool = False,
         pricing: Optional[PricingPolicy] = None,
     ):
+        # HIGH FIX #15: Handle None default for mutable argument
+        if env is None:
+            env = {}
         super().__init__(
             cpu=cpu,
             memory=memory,

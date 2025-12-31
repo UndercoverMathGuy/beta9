@@ -129,6 +129,10 @@ func (wpc *LocalKubernetesWorkerPoolController) AddWorkerToMachine(cpu int64, me
 	return nil, errors.New("unimplemented")
 }
 
+func(wpc *LocalKubernetesWorkerPoolController) AddWorkerGroup(request *types.GangRequest) ([]*types.Worker, error) {
+	return nil, errors.New("Gang scheduling and node clusters not supported on local pools") // TODO Don't have pool topology detection for RDMA/colo detection for appropriate node creation
+}
+
 func (wpc *LocalKubernetesWorkerPoolController) addWorkerWithId(workerId string, cpu int64, memory int64, gpuType string, gpuCount uint32) (*types.Worker, error) {
 	if wpc.workspace == nil {
 		adminWorkspace, err := wpc.backendRepo.GetAdminWorkspace(wpc.ctx)

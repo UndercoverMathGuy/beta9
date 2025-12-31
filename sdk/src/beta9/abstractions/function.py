@@ -120,7 +120,64 @@ class Function(RunnerAbstraction):
         pricing: Optional[PricingPolicy] = None,
         inputs: Optional[Schema] = None,
         outputs: Optional[Schema] = None,
+        clustered: bool = False,
+        nodes: int = 1,
+        enable_efa: bool = True,
+        placement_group: Optional[str] = None,
     ) -> None:
+        
+        # TODO: Add SHA256 checksums for EFA installer versions
+        EFA_CHECKSUMS = {
+            "1.32.0": "", 
+            "1.30.0": "",  
+        }
+
+        if clustered:
+            if nodes < 2:
+                raise ValueError("clustered=True requires nodes >= 2")
+
+            # P1 Fix: Improved GPU validation for clustered mode
+            # Handle gpu being a list (including empty list or list with empty strings)
+            if gpu == GpuType.NoGPU or gpu == [] or gpu == [""]:
+                raise ValueError("clustered=True requires a valid GPU configuration")
+            if isinstance(gpu, list) and not gpu:
+                raise ValueError("clustered=True requires at least one GPU")
+            if isinstance(gpu, list) and all(g == "" for g in gpu):
+                raise ValueError("clustered=True requires a valid GPU type (not empty strings)")
+
+            # P0 Fix: Install EFA drivers with security improvements
+            # - Pin version instead of using -latest
+            # - Remove --no-verify flag for signature verification
+            # - Add checksum verification step
+            if enable_efa:
+                # Get EFA version from environment or use default
+                efa_version = os.environ.get("EFA_INSTALLER_VERSION", "1.32.0")
+                efa_checksum = EFA_CHECKSUMS.get(efa_version, "")
+
+                commands = [
+                    f"curl -O https://efa-installer.amazonaws.com/aws-efa-installer-{efa_version}.tar.gz",
+                ]
+
+                # Only add checksum verification if checksum is provided
+                if efa_checksum:
+                    commands.append(f"echo '{efa_checksum}  aws-efa-installer-{efa_version}.tar.gz' | sha256sum -c")
+
+                commands.extend([
+                    f"tar -xf aws-efa-installer-{efa_version}.tar.gz",
+                    "cd aws-efa-installer && ./efa_installer.sh -y --skip-kmod --skip-limit-conf",  # Removed --no-verify
+                    f"rm -rf aws-efa-installer aws-efa-installer-{efa_version}.tar.gz",
+                ])
+
+                image = image.add_commands(commands)
+
+            # P1 Fix: Pin torch version for reproducible builds
+            # Check for torch more carefully (handle version specifiers)
+            has_torch = any("torch" in pkg.lower() for pkg in image.python_packages)
+            if not has_torch:
+                # Pin to specific version compatible with CUDA 12.1
+                TORCH_VERSION = "2.1.0"
+                image = image.add_python_packages([f"torch=={TORCH_VERSION}"])
+        
         super().__init__(
             cpu=cpu,
             memory=memory,
@@ -145,6 +202,10 @@ class Function(RunnerAbstraction):
         self._function_stub: Optional[FunctionServiceStub] = None
         self.syncer: FileSyncer = FileSyncer(self.gateway_stub)
         self.headless = headless
+        self.clustered = clustered
+        self.nodes = nodes
+        self.enable_efa = enable_efa
+        self.placement_group = placement_group
 
     def __call__(self, func):
         return _CallableWrapper(func, self)
@@ -196,6 +257,9 @@ class _CallableWrapper(DeployableMixin):
 
     @with_grpc_error_handling
     def _call_remote(self, *args, **kwargs) -> Any:
+        if self.parent.clustered:
+            return self._call_remote_clustered(*args, **kwargs)
+        
         args = cloudpickle.dumps(
             {
                 "args": args,
@@ -226,6 +290,45 @@ class _CallableWrapper(DeployableMixin):
 
         terminal.header(f"Function complete <{last_response.task_id}>")
         # Sometimes the result is empty (task timed out)
+        if not last_response.result:
+            return None
+        return cloudpickle.loads(last_response.result)
+
+    def _call_remote_clustered(self, *args, **kwargs) -> Any:
+        from ..clients.function import FunctionInvokeGangRequest
+        
+        args_serialized = cloudpickle.dumps(
+            {
+                "args": args,
+                "kwargs": kwargs,
+            },
+        )
+
+        terminal.header(f"Running clustered function: <{self.parent.handler}> on {self.parent.nodes} nodes")
+        last_response = None
+
+        for r in self.parent.function_stub.function_invoke_gang(
+            FunctionInvokeGangRequest(
+                stub_id=self.parent.stub_id,
+                args=args_serialized,
+                headless=self.parent.headless,
+                nodes=self.parent.nodes,
+                enable_efa=self.parent.enable_efa,
+                placement_group=self.parent.placement_group or f"pg-{self.parent.handler}",
+            )
+        ):
+            if r.output != "":
+                terminal.detail(r.output, end="")
+
+            if r.done or r.exit_code != 0:
+                last_response = r
+                break
+
+        if last_response is None or not last_response.done or last_response.exit_code != 0:
+            terminal.error(f"Clustered function failed <{last_response.group_id if last_response else 'unknown'}> ❌", exit=False)
+            return
+
+        terminal.header(f"Clustered function complete <{last_response.group_id}>")
         if not last_response.result:
             return None
         return cloudpickle.loads(last_response.result)

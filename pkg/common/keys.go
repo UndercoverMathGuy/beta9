@@ -7,6 +7,7 @@ import (
 var (
 	schedulerPrefix                  string = "scheduler:"
 	schedulerContainerRequests       string = "scheduler:container_requests"
+	schedulerGangContainerRequests   string = "scheduler:gang_container_requests"
 	schedulerWorkerLock              string = "scheduler:worker:lock:%s"
 	schedulerWorkerRequests          string = "scheduler:worker:requests:%s"
 	schedulerWorkerIndex             string = "scheduler:worker:worker_index"
@@ -25,6 +26,13 @@ var (
 	schedulerCheckpointState         string = "scheduler:checkpoint_state:%s:%s"
 	schedulerServeLock               string = "scheduler:serve:lock:%s:%s"
 	schedulerStubState               string = "scheduler:stub:state:%s"
+)
+
+var (
+	schedulerNodeGroupState string = "scheduler:nodegroup:state:%s"
+	schedulerNodeGroupIndex string = "scheduler:nodegroup:index"
+	schedulerNodeGroupMachineIndex string = "scheduler:nodegroup:machine_index:%s"
+	schedulerNodeGroupLock string = "scheduler:nodegroup:lock:%s"
 )
 
 var (
@@ -109,6 +117,10 @@ func (rk *redisKeys) SchedulerContainerRequests() string {
 	return schedulerContainerRequests
 }
 
+func (rk *redisKeys) SchedulerGangContainerRequests() string {
+	return schedulerGangContainerRequests
+}
+
 func (rk *redisKeys) SchedulerWorkerLock(workerId string) string {
 	return fmt.Sprintf(schedulerWorkerLock, workerId)
 }
@@ -175,6 +187,22 @@ func (rk *redisKeys) SchedulerCheckpointState(workspaceName, checkpointId string
 
 func (rk *redisKeys) SchedulerStubState(stubId string) string {
 	return fmt.Sprintf(schedulerStubState, stubId)
+}
+
+func (rk *redisKeys) SchedulerNodeGroupState(groupId string) string {
+    return fmt.Sprintf(schedulerNodeGroupState, groupId)
+}
+
+func (rk *redisKeys) SchedulerNodeGroupIndex() string {
+    return schedulerNodeGroupIndex
+}
+
+func (rk *redisKeys) SchedulerNodeGroupMachineIndex(machineId string) string {
+    return fmt.Sprintf(schedulerNodeGroupMachineIndex, machineId)
+}
+
+func (rk *redisKeys) SchedulerNodeGroupLock(groupId string) string {
+    return fmt.Sprintf(schedulerNodeGroupLock, groupId)
 }
 
 // Gateway keys

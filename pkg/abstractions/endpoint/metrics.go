@@ -14,18 +14,28 @@ type LatencyMetrics struct {
 	QueueVelocity float64
 }
 
+// PercentileValue calculates the nth percentile using linear interpolation.
+// MEDIUM FIX #20: Added bounds checking for percentile value
 func PercentileValue(n float64, values *[]int) float64 {
-	if len(*values) == 0 {
+	length := len(*values)
+	if length == 0 {
 		return 0
 	}
-	if len(*values) == 1 {
+	if length == 1 {
 		return float64((*values)[0])
 	}
-	idx := n * (float64(len(*values)) - 1) / 100
+	// Ensure n is within valid range [0, 100]
+	if n < 0 {
+		n = 0
+	}
+	if n > 100 {
+		n = 100
+	}
+	idx := n * (float64(length) - 1) / 100
 	lower := int(idx)
 	upper := lower + 1
-	if upper >= len(*values) {
-		return float64((*values)[len(*values)-1])
+	if upper >= length {
+		return float64((*values)[length-1])
 	}
 	fraction := idx - float64(lower)
 	return float64((*values)[lower])*(1-fraction) + float64((*values)[upper])*fraction

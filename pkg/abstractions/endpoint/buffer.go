@@ -39,10 +39,12 @@ const (
 )
 
 type request struct {
-	ctx       echo.Context
-	task      *EndpointTask
-	done      chan struct{}
-	processed bool
+	ctx           echo.Context
+	task          *EndpointTask
+	done          chan struct{}
+	doneOnce      sync.Once
+	processed     bool
+	processedLock sync.Mutex
 }
 
 type container struct {
@@ -53,6 +55,7 @@ type container struct {
 
 type RequestBuffer struct {
 	ctx                     context.Context
+	cancel                  context.CancelFunc
 	httpClient              *http.Client
 	tailscale               *network.Tailscale
 	tsConfig                types.TailscaleConfig
@@ -83,8 +86,12 @@ func NewRequestBuffer(
 	tsConfig types.TailscaleConfig,
 	isASGI bool,
 ) *RequestBuffer {
+	// Create cancellable context for cleanup
+	ctx, cancel := context.WithCancel(ctx)
+
 	rb := &RequestBuffer{
 		ctx:                     ctx,
+		cancel:                  cancel,
 		rdb:                     rdb,
 		workspace:               workspace,
 		stubId:                  stubId,
@@ -94,7 +101,7 @@ func NewRequestBuffer(
 		availableContainersLock: sync.RWMutex{},
 		containerRepo:           containerRepo,
 		keyEventManager:         keyEventManager,
-		keyEventChan:            make(chan common.KeyEvent),
+		keyEventChan:            make(chan common.KeyEvent, 100), // Buffered to prevent blocking
 		httpClient:              &http.Client{},
 		tailscale:               tailscale,
 		tsConfig:                tsConfig,
@@ -160,7 +167,11 @@ func (rb *RequestBuffer) ForwardRequest(ctx echo.Context, task *EndpointTask) er
 		case <-rb.ctx.Done():
 			return nil
 		case <-ctx.Request().Context().Done():
-			if !req.processed {
+			// CRITICAL FIX #10: Access req.processed under lock
+			req.processedLock.Lock()
+			wasProcessed := req.processed
+			req.processedLock.Unlock()
+			if !wasProcessed {
 				rb.cancelInFlightTask(req.task, types.TaskRequestCancelled)
 			}
 			return nil
@@ -176,7 +187,12 @@ func (rb *RequestBuffer) processRequests() {
 		case <-rb.ctx.Done():
 			return
 		default:
-			if len(rb.availableContainers) == 0 {
+			// CRITICAL FIX #3: Access availableContainers under lock
+			rb.availableContainersLock.RLock()
+			hasContainers := len(rb.availableContainers) > 0
+			rb.availableContainersLock.RUnlock()
+
+			if !hasContainers {
 				time.Sleep(requestProcessingInterval)
 				continue
 			}
@@ -408,7 +424,10 @@ func (rb *RequestBuffer) acquireRequestToken(containerId string) error {
 	// If the token count is negative, we exceeded our threshold of
 	// available request tokens, just reverse the operation
 	if tokenCount < 0 {
-		rb.rdb.Incr(rb.ctx, tokenKey)
+		// HIGH FIX #17: Check error from Incr
+		if err := rb.rdb.Incr(rb.ctx, tokenKey).Err(); err != nil {
+			log.Error().Err(err).Str("container_id", containerId).Msg("Failed to restore token after overflow")
+		}
 		return errors.New("too many in-flight requests")
 	}
 
@@ -488,7 +507,11 @@ func (rb *RequestBuffer) handleRequest(req *request) {
 	}
 	defer rb.afterRequest(req, c.id)
 
+	// CRITICAL FIX #10: Set processed under lock
+	req.processedLock.Lock()
 	req.processed = true
+	req.processedLock.Unlock()
+
 	if req.ctx.IsWebSocket() {
 		rb.handleWSRequest(req, c)
 	} else {
@@ -525,8 +548,11 @@ func (rb *RequestBuffer) handleBatchRequest(batch *batchBuffer) {
 		return
 	}
 	defer rb.afterBatchRequest(batch, c.id, batch.batchId)
+	// CRITICAL FIX #10: Set processed under lock
 	for _, req := range batch.requests {
+		req.processedLock.Lock()
 		req.processed = true
+		req.processedLock.Unlock()
 	}
 	done := make(chan struct{})
 	go rb.batchHeartBeat(rb.ctx, batch.batchId, c.id, done)
@@ -538,9 +564,17 @@ func (rb *RequestBuffer) handleBatchRequest(batch *batchBuffer) {
 
 func (rb *RequestBuffer) RecordLatency(latency time.Duration) {
 	key := Keys.endpointLatencyWindow(rb.workspace.Name, rb.stubId)
-	rb.rdb.LPush(rb.ctx, key, latency.Milliseconds())
-	rb.rdb.LTrim(rb.ctx, key, 0, 99)
-	rb.rdb.Expire(rb.ctx, key, 5*time.Minute)
+	// HIGH FIX #11: Log Redis errors instead of silently ignoring
+	if err := rb.rdb.LPush(rb.ctx, key, latency.Milliseconds()).Err(); err != nil {
+		log.Warn().Err(err).Str("stub_id", rb.stubId).Msg("Failed to record latency to Redis")
+		return
+	}
+	if err := rb.rdb.LTrim(rb.ctx, key, 0, 99).Err(); err != nil {
+		log.Warn().Err(err).Str("stub_id", rb.stubId).Msg("Failed to trim latency window")
+	}
+	if err := rb.rdb.Expire(rb.ctx, key, 5*time.Minute).Err(); err != nil {
+		log.Warn().Err(err).Str("stub_id", rb.stubId).Msg("Failed to set latency window expiry")
+	}
 }
 
 func (rb *RequestBuffer) handleWSRequest(req *request, c container) {
@@ -950,8 +984,11 @@ func (rb *RequestBuffer) batchHeartBeat(ctx context.Context, batchId string, con
 }
 
 func (rb *RequestBuffer) afterBatchRequest(batch *batchBuffer, containerId string, batchId string) {
+	// CRITICAL FIX #1: Use sync.Once to safely close done channel (prevent double-close panic)
 	for _, req := range batch.requests {
-		close(req.done)
+		req.doneOnce.Do(func() {
+			close(req.done)
+		})
 	}
 
 	rb.releaseRequestToken(containerId, batchId)
@@ -968,8 +1005,11 @@ func (rb *RequestBuffer) afterBatchRequest(batch *batchBuffer, containerId strin
 }
 
 func (rb *RequestBuffer) afterRequest(req *request, containerId string) {
+	// CRITICAL FIX #1: Use sync.Once to safely close done channel (prevent double-close panic)
 	defer func() {
-		close(req.done)
+		req.doneOnce.Do(func() {
+			close(req.done)
+		})
 	}()
 
 	defer rb.releaseRequestToken(containerId, req.task.msg.TaskId)

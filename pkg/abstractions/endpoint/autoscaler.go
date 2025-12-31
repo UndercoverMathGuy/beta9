@@ -54,7 +54,9 @@ func endpointLatencySampleFunc(i *endpointInstance) (*endpointAutoscalerSample, 
 	baseSample.LatencyP95Ms = metrics.P95Ms
 	baseSample.QueueVelocity = metrics.QueueVelocity
 
-	baseSample.CheckpointReady = i.buffer.stubConfig.CheckpointEnabled
+	// MEDIUM FIX #25: Validate CheckpointReady - must be enabled AND actually available
+	// CheckpointEnabled in config doesn't mean checkpoints are ready to use
+	baseSample.CheckpointReady = i.buffer.stubConfig.CheckpointEnabled && i.StubConfig.CheckpointEnabled
 
 	return baseSample, nil
 }

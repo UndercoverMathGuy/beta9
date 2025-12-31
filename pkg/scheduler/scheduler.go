@@ -31,6 +31,9 @@ type Scheduler struct {
 	workerRepo            repo.WorkerRepository
 	workerPoolManager     *WorkerPoolManager
 	requestBacklog        *RequestBacklog
+	providerRepo repo.ProviderRepository
+	gangBacklog           *RequestGangBacklog
+	nodeGroupRepo         repo.NodeGroupRepository
 	containerRepo         repo.ContainerRepository
 	workspaceRepo         repo.WorkspaceRepository
 	eventRepo             repo.EventRepository
@@ -43,9 +46,11 @@ func NewScheduler(ctx context.Context, config types.AppConfig, redisClient *comm
 	workerRepo := repo.NewWorkerRedisRepository(redisClient, config.Worker)
 	providerRepo := repo.NewProviderRedisRepository(redisClient)
 	requestBacklog := NewRequestBacklog(redisClient)
+	// P1 Fix: NewRequestGangBacklog no longer takes ctx parameter
+	gangBacklog := NewRequestGangBacklog(redisClient)
 	containerRepo := repo.NewContainerRedisRepository(redisClient)
 	workerPoolRepo := repo.NewWorkerPoolRedisRepository(redisClient)
-
+	nodeGroupRepo := repo.NewNodeGroupRedisRepository(redisClient, ctx)
 	schedulerUsage := NewSchedulerUsageMetrics(usageRepo)
 	eventRepo := repo.NewTCPEventClientRepo(config.Monitoring.FluentBit.Events)
 
@@ -104,6 +109,9 @@ func NewScheduler(ctx context.Context, config types.AppConfig, redisClient *comm
 		workerRepo:            workerRepo,
 		workerPoolManager:     workerPoolManager,
 		requestBacklog:        requestBacklog,
+		providerRepo: providerRepo,
+		gangBacklog:           gangBacklog,
+		nodeGroupRepo:         nodeGroupRepo,
 		containerRepo:         containerRepo,
 		schedulerUsageMetrics: schedulerUsage,
 		eventRepo:             eventRepo,

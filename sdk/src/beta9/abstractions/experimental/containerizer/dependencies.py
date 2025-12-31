@@ -115,11 +115,32 @@ def _iter_python_files(
     """
     search_root = target_dir if target_dir else repo_root
     py_files = []
+    # MEDIUM FIX #28: Track visited real paths to prevent symlink loops
+    visited_real_paths: set = set()
+
     for path in search_root.rglob("*.py"):
+        # Prevent symlink-based DoS by checking real paths
         try:
+            real_path = path.resolve()
+            if real_path in visited_real_paths:
+                continue
+            visited_real_paths.add(real_path)
+
+            # Skip symlinks that point outside the repo
+            if path.is_symlink():
+                try:
+                    real_path.relative_to(repo_root.resolve())
+                except ValueError:
+                    # Symlink points outside repo - skip
+                    continue
+
             parts = path.relative_to(repo_root).parts
         except ValueError:
             parts = path.parts
+        except OSError:
+            # Handle broken symlinks or permission errors
+            continue
+
         if any(part in DEFAULT_EXCLUDE_DIRS or part.startswith(".") for part in parts):
             continue
         if any(p in parts for p in ("site-packages", "dist-packages")):
@@ -257,11 +278,26 @@ def discover_dependencies(
     """
     path = pl.Path(project_path)
     repo_root = _find_repo_root(path)
-    
+
     # Resolve target directory
     target_dir = None
     if target:
-        target_dir = repo_root / target if not pl.Path(target).is_absolute() else pl.Path(target)
+        # CRITICAL FIX #6: Prevent path traversal - always resolve relative to repo_root
+        # and validate the resolved path is within repo_root
+        if pl.Path(target).is_absolute():
+            target_dir = pl.Path(target).resolve()
+        else:
+            target_dir = (repo_root / target).resolve()
+
+        # Security check: ensure target is within repo_root (prevent path traversal)
+        try:
+            target_dir.relative_to(repo_root.resolve())
+        except ValueError:
+            raise ValueError(
+                f"Target directory '{target}' is outside repository root. "
+                f"Path traversal is not allowed for security reasons."
+            )
+
         if not target_dir.exists():
             raise ValueError(f"Target directory does not exist: {target_dir}")
         if not target_dir.is_dir():

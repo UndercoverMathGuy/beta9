@@ -117,6 +117,67 @@ func (t *TCPEventClientRepo) PushContainerRequestedEvent(request *types.Containe
 	)
 }
 
+func (t *TCPEventClientRepo) PushClusterRequestedEvent(request *types.GangRequest) {
+	var stubId string
+	if len(request.ContainerRequests) > 0 {
+		stubId = request.ContainerRequests[0].StubId
+	}
+
+	t.pushEvent(
+		types.EventClusterLifecycle,
+		types.EventClusterStatusRequestedSchemaVersion,
+		types.EventClusterStatusRequestedSchema{
+			GroupID:   request.GroupID,
+			NodeCount: request.NodeCount,
+			StubID:    stubId,
+			Status:    types.EventClusterLifecycleRequested,
+		},
+	)
+}
+
+func (t *TCPEventClientRepo) PushClusterScheduledEvent(request *types.GangRequest) {
+	var stubId string
+	if len(request.ContainerRequests) > 0 {
+		stubId = request.ContainerRequests[0].StubId
+	}
+
+	// HIGH FIX #16: Use consistent EventClusterLifecycleSchema for all cluster events
+	t.pushEvent(
+		types.EventClusterLifecycle,
+		types.EventClusterLifecycleSchemaVersion,
+		types.EventClusterLifecycleSchema{
+			GroupID:   request.GroupID,
+			NodeCount: request.NodeCount,
+			StubID:    stubId,
+			Status:    types.EventClusterLifecycleScheduled,
+		},
+	)
+}
+
+func (t *TCPEventClientRepo) PushClusterFailedEvent(groupId string, failureReason string) {
+	t.pushEvent(
+		types.EventClusterLifecycle,
+		types.EventClusterLifecycleSchemaVersion,
+		types.EventClusterLifecycleSchema{
+			GroupID:       groupId,
+			Status:        types.EventClusterLifecycleFailed,
+			FailureReason: failureReason,
+		},
+	)
+}
+
+func (t *TCPEventClientRepo) PushClusterCompletedEvent(groupId string) {
+	// HIGH FIX #16: Use consistent EventClusterLifecycleSchema for all cluster events
+	t.pushEvent(
+		types.EventClusterLifecycle,
+		types.EventClusterLifecycleSchemaVersion,
+		types.EventClusterLifecycleSchema{
+			GroupID: groupId,
+			Status:  types.EventClusterLifecycleCompleted,
+		},
+	)
+}
+
 func (t *TCPEventClientRepo) PushContainerScheduledEvent(containerID string, workerID string, request *types.ContainerRequest) {
 	t.pushEvent(
 		types.EventContainerLifecycle,

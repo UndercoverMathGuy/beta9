@@ -135,6 +135,19 @@ class Autoscaler:
     tasks_per_container: int = DEFAULT_AUTOSCALER_TASKS_PER_CONTAINER
     min_containers: int = DEFAULT_AUTOSCALER_MIN_CONTAINERS
 
+    def __post_init__(self):
+        # MEDIUM FIX #27: Validate autoscaler parameters
+        if self.max_containers < 1:
+            raise ValueError(f"max_containers must be >= 1, got {self.max_containers}")
+        if self.tasks_per_container < 1:
+            raise ValueError(f"tasks_per_container must be >= 1, got {self.tasks_per_container}")
+        if self.min_containers < 0:
+            raise ValueError(f"min_containers must be >= 0, got {self.min_containers}")
+        if self.min_containers > self.max_containers:
+            raise ValueError(
+                f"min_containers ({self.min_containers}) cannot exceed max_containers ({self.max_containers})"
+            )
+
 
 @dataclass
 class QueueDepthAutoscaler(Autoscaler):
@@ -146,6 +159,14 @@ class LatencyAutoscaler(Autoscaler):
     latency_threshold: int = 1000  # ms
     queue_velocity: int = 10  # requests/sec
     enable_criu_scaling: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        # MEDIUM FIX #27: Validate latency autoscaler parameters
+        if self.latency_threshold < 0:
+            raise ValueError(f"latency_threshold must be >= 0, got {self.latency_threshold}")
+        if self.queue_velocity < 0:
+            raise ValueError(f"queue_velocity must be >= 0, got {self.queue_velocity}")
 
 
 @dataclass
@@ -179,12 +200,19 @@ class Batch:
     Configuration for dynamic batching on endpoints.
     Parameters:
         max_size (int):
-            The maximum number of requests to batch together.
+            The maximum number of requests to batch together. Must be >= 1.
         wait_ms (int):
-            The maximum amount of time to wait for additional requests before processing the batch.
+            The maximum amount of time to wait for additional requests before processing the batch. Must be >= 0.
     """
     max_size: int = 1
     wait_ms: int = 50
+
+    def __post_init__(self):
+        # MEDIUM FIX #26: Validate batch parameters
+        if self.max_size < 1:
+            raise ValueError(f"Batch max_size must be >= 1, got {self.max_size}")
+        if self.wait_ms < 0:
+            raise ValueError(f"Batch wait_ms must be >= 0, got {self.wait_ms}")
 
 @dataclass
 class PricingPolicy:

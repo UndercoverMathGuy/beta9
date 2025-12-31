@@ -91,6 +91,25 @@ class FunctionScheduleResponse(betterproto.Message):
     scheduled_job_id: str = betterproto.string_field(3)
 
 
+@dataclass(eq=False, repr=False)
+class FunctionInvokeGangRequest(betterproto.Message):
+    stub_id: str = betterproto.string_field(1)
+    args: bytes = betterproto.bytes_field(2)
+    headless: bool = betterproto.bool_field(3)
+    nodes: int = betterproto.int32_field(4)
+    enable_efa: bool = betterproto.bool_field(5)
+    placement_group: str = betterproto.string_field(6)
+
+
+@dataclass(eq=False, repr=False)
+class FunctionInvokeGangResponse(betterproto.Message):
+    group_id: str = betterproto.string_field(1)
+    output: str = betterproto.string_field(2)
+    done: bool = betterproto.bool_field(3)
+    exit_code: int = betterproto.int32_field(4)
+    result: bytes = betterproto.bytes_field(5)
+
+
 class FunctionServiceStub(SyncServiceStub):
     def function_invoke(
         self, function_invoke_request: "FunctionInvokeRequest"
@@ -138,3 +157,13 @@ class FunctionServiceStub(SyncServiceStub):
             FunctionScheduleRequest,
             FunctionScheduleResponse,
         )(function_schedule_request)
+
+    def function_invoke_gang(
+        self, function_invoke_gang_request: "FunctionInvokeGangRequest"
+    ) -> Iterator["FunctionInvokeGangResponse"]:
+        for response in self._unary_stream(
+            "/function.FunctionService/FunctionInvokeGang",
+            FunctionInvokeGangRequest,
+            FunctionInvokeGangResponse,
+        )(function_invoke_gang_request):
+            yield response

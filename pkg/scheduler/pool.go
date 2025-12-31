@@ -43,6 +43,9 @@ const (
 type WorkerPoolController interface {
 	AddWorker(cpu int64, memory int64, gpuCount uint32) (*types.Worker, error)
 	AddWorkerToMachine(cpu int64, memory int64, gpuType string, gpuCount uint32, machineId string) (*types.Worker, error)
+
+	AddWorkerGroup(request *types.GangRequest) ([]*types.Worker, error) // ** Specs pulled from GangRequest.ContainerRequests[0] - same specs across all nodes 
+
 	Name() string
 	FreeCapacity() (*WorkerPoolCapacity, error)
 	Context() context.Context

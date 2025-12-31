@@ -73,9 +73,22 @@ class Config:
         bind_port = int(os.getenv("BIND_PORT"))
         timeout = int(os.getenv("TIMEOUT", 180))
         checkpoint_enabled = os.getenv("CHECKPOINT_ENABLED", "false").lower() == "true"
-        volume_cache_map = json.loads(os.getenv("VOLUME_CACHE_MAP", "{}"))
-        inputs = json.loads(os.getenv("BETA9_INPUTS", "{}"))
-        outputs = json.loads(os.getenv("BETA9_OUTPUTS", "{}"))
+
+        # MEDIUM FIX #34: Handle JSON deserialization errors gracefully
+        try:
+            volume_cache_map = json.loads(os.getenv("VOLUME_CACHE_MAP", "{}"))
+        except json.JSONDecodeError:
+            volume_cache_map = {}
+
+        try:
+            inputs = json.loads(os.getenv("BETA9_INPUTS", "{}"))
+        except json.JSONDecodeError:
+            inputs = {}
+
+        try:
+            outputs = json.loads(os.getenv("BETA9_OUTPUTS", "{}"))
+        except json.JSONDecodeError:
+            outputs = {}
 
         if workers <= 0:
             workers = 1

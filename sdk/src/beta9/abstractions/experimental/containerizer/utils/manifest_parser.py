@@ -95,12 +95,12 @@ def parse_pyproject_toml(
     
     try:
         data = tomllib.loads(pyproject_path.read_text())
-        
+
         project = data.get("project", {})
         deps = project.get("dependencies", [])
         optional = project.get("optional-dependencies", {})
         python_req = project.get("requires-python")
-        
+
         # UV-specific sources (for PyTorch CUDA, etc.)
         uv_sources = {}
         tool_uv = data.get("tool", {}).get("uv", {})
@@ -108,9 +108,16 @@ def parse_pyproject_toml(
             uv_sources["sources"] = tool_uv["sources"]
         if "index" in tool_uv:
             uv_sources["index"] = tool_uv["index"]
-        
+
         return deps, optional, python_req, uv_sources
-    except Exception:
+    except Exception as e:
+        # HIGH FIX #19: Log parsing errors instead of silently returning empty results
+        import warnings
+        warnings.warn(
+            f"Failed to parse pyproject.toml at {pyproject_path}: {e}. "
+            "Dependencies from this file will be ignored.",
+            stacklevel=2,
+        )
         return [], {}, None, {}
 
 

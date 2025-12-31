@@ -42,6 +42,15 @@ type WorkerRepository interface {
 	GetPreemptibleGpus() []string
 }
 
+type NodeGroupRepository interface {
+	AddNodeGroup(nodeGroup *types.NodeGroup) error
+	GetNodeGroupById(groupId string) (*types.NodeGroup, error)
+	GetNodeGroupByMachineId(machineId string) (*types.NodeGroup, error)
+	UpdateNodeGroupStatus(groupId string, status types.NodeGroupStatus) error
+	DeleteNodeGroup(groupId string) error
+	GetAllNodeGroups() ([]*types.NodeGroup, error)
+}
+
 type ContainerRepository interface {
 	GetContainerState(string) (*types.ContainerState, error)
 	SetContainerState(string, *types.ContainerState) error
@@ -239,6 +248,10 @@ type EventRepository interface {
 	PushWorkerPoolDegradedEvent(poolName string, reasons []string, poolState *types.WorkerPoolState)
 	PushWorkerPoolHealthyEvent(poolName string, poolState *types.WorkerPoolState)
 	PushGatewayEndpointCalledEvent(method, path, workspaceID string, statusCode int, userAgent, remoteIP, requestID, contentType, accept, errorMessage string)
+	PushClusterRequestedEvent(request *types.GangRequest)
+	PushClusterScheduledEvent(request *types.GangRequest)
+	PushClusterFailedEvent(groupId string, failedMachineId string)
+	PushClusterCompletedEvent(groupId string)
 }
 
 type UsageMetricsRepository interface {

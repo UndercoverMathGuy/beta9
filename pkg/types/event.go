@@ -42,6 +42,8 @@ var (
 	EventStubRun            = "stub.run"
 	EventStubClone          = "stub.clone"
 
+	EventClusterLifecycle = "cluster.lifecycle"
+
 	EventWorkerPoolDegraded = "workerpool.degraded"
 	EventWorkerPoolHealthy  = "workerpool.healthy"
 
@@ -55,6 +57,13 @@ var (
 	EventContainerLifecycleStopped   = "stopped"
 	EventContainerLifecycleOOM       = "oom"
 	EventContainerLifecycleFailed    = "failed"
+)
+
+var (
+	EventClusterLifecycleRequested = "requested"
+	EventClusterLifecycleScheduled = "scheduled"
+	EventClusterLifecycleFailed    = "failed"
+	EventClusterLifecycleCompleted = "completed"
 )
 
 var (
@@ -118,6 +127,28 @@ type EventContainerStatusRequestedSchema struct {
 	Request     ContainerRequest `json:"request"`
 	StubID      string           `json:"stub_id"`
 	Status      string           `json:"status"`
+}
+
+var EventClusterStatusRequestedSchemaVersion = "1.0"
+
+type EventClusterStatusRequestedSchema struct {
+	GroupID   string   `json:"group_id"`
+	NodeCount int      `json:"node_count"`
+	StubID    string   `json:"stub_id"`
+	Status    string   `json:"status"`
+	WorkerIDs []string `json:"worker_ids,omitempty"`
+}
+
+var EventClusterLifecycleSchemaVersion = "1.0"
+
+type EventClusterLifecycleSchema struct {
+	GroupID         string   `json:"group_id"`
+	NodeCount       int      `json:"node_count"`
+	WorkerIDs       []string `json:"worker_ids,omitempty"`
+	StubID          string   `json:"stub_id"`
+	Status          string   `json:"status"`
+	FailureReason   string   `json:"failure_reason,omitempty"`
+	FailedMachineID string   `json:"failed_machine_id,omitempty"`
 }
 
 var EventWorkerLifecycleSchemaVersion = "1.0"

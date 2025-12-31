@@ -14,7 +14,15 @@ type SchedulerService struct {
 
 func NewSchedulerService(scheduler *Scheduler) (*SchedulerService, error) {
 	go scheduler.StartProcessingRequests() // Start processing ContainerRequests
-
+	go scheduler.StartProcessingGangRequests()
+	gangHealthMonitor := NewGangHealthMonitor(
+		scheduler.ctx,
+		scheduler.nodeGroupRepo,
+		scheduler.providerRepo,
+		scheduler.containerRepo,
+		scheduler.eventRepo,
+	)
+	go gangHealthMonitor.Start()
 	return &SchedulerService{
 		Scheduler: scheduler,
 	}, nil
@@ -67,3 +75,49 @@ func (wbs *SchedulerService) RunContainer(ctx context.Context, in *pb.RunContain
 	}, nil
 }
 
+func (wbs *SchedulerService) RunGang(ctx context.Context, in *pb.RunGangRequest) (*pb.RunGangResponse, error) {
+	containerRequests := make([]*types.ContainerRequest, 0, len(in.ContainerRequests))
+
+	for _, cr := range in.ContainerRequests {
+		cpuRequest, err := ParseCPU(cr.Cpu)
+		if err != nil {
+			return &pb.RunGangResponse{Success: false, Error: err.Error()}, nil
+		}
+		memoryRequest, err := ParseMemory(cr.Memory)
+		if err != nil {
+			return &pb.RunGangResponse{Success: false, Error: err.Error()}, nil
+		}
+
+		containerRequests = append(containerRequests, &types.ContainerRequest{
+			ContainerId: cr.ContainerId,
+			EntryPoint:  cr.EntryPoint,
+			Env:         cr.Env,
+			Cpu:         cpuRequest,
+			Memory:      memoryRequest,
+			Gpu:         cr.Gpu,
+			GpuCount:    cr.GpuCount,
+			ImageId:     cr.ImageId,
+			StubId:      cr.StubId,
+			WorkspaceId: cr.WorkspaceId,
+		})
+	}
+	gangRequest := &types.GangRequest{
+		GroupID:           in.GroupId,
+		NodeCount:         int(in.NodeCount),
+		ContainerRequests: containerRequests,
+		PlacementGroup:    in.PlacementGroup,
+		EnableEFA:         in.EnableEfa,
+	}
+	err := wbs.Scheduler.GangRun(gangRequest)
+	if err != nil {
+		return &pb.RunGangResponse{
+			Success: false,
+			Error:   err.Error(),
+			GroupId: in.GroupId,
+		}, nil
+	}
+	return &pb.RunGangResponse{
+		Success: true,
+		GroupId: in.GroupId,
+	}, nil
+}

@@ -1,3 +1,4 @@
+import contextvars
 import os
 import time
 from dataclasses import dataclass
@@ -18,6 +19,17 @@ from .runner.common import config as cfg
 from .runner.common import end_task_and_send_callback
 from .type import TaskStatus
 
+# P1 Fix: Use contextvars instead of global os.environ for task_id
+# This prevents race conditions between concurrent async requests
+_current_task_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "current_task_id", default=None
+)
+
+
+def get_current_task_id() -> Optional[str]:
+    """Get the current task ID from context (thread/async safe)."""
+    return _current_task_id.get()
+
 
 @dataclass
 class TaskLifecycleData:
@@ -32,7 +44,9 @@ async def run_task(request, func, func_args):
     if not task_id:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="Task ID missing")
 
-    os.environ["TASK_ID"] = task_id
+    # P1 Fix: Use contextvars for async-safe task_id storage
+    # Removed os.environ mutation (no longer backward compatible - use get_current_task_id() instead)
+    token = _current_task_id.set(task_id)
     with StdoutJsonInterceptor(task_id=task_id):
         print(f"Received task <{task_id}>")
 
@@ -61,8 +75,8 @@ async def run_task(request, func, func_args):
             print(f"Task <{task_id}> finished")
             return response
         finally:
-            if "TASK_ID" in os.environ:
-                del os.environ["TASK_ID"]
+            # P1 Fix: Reset contextvars token only (no more os.environ cleanup needed)
+            _current_task_id.reset(token)
 
             end_task_and_send_callback(
                 gateway_stub=request.app.state.gateway_stub,
@@ -93,7 +107,9 @@ class WebsocketTaskLifecycleMiddleware:
 
 class TaskLifecycleMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health" or request.url.path == "/__batch__":
+        # MEDIUM FIX #38: Use startswith for path matching to handle trailing slashes
+        path = request.url.path.rstrip("/")
+        if path == "/health" or path == "/__batch__":
             # ! Batched tasks skip the middleware. All middleware logic for batched tasks is handled in endpoint.py directly
             return await call_next(request)
 

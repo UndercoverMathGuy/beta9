@@ -20,6 +20,8 @@ type ProviderComputeRequest struct {
 	Memory   int64
 	Gpu      string
 	GpuCount uint32
+	PlacementGroupName string 
+	EnableEFA          bool  
 }
 
 type ProviderMachine struct {

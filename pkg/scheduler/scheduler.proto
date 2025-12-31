@@ -7,6 +7,7 @@ package scheduler;
 service Scheduler {
   rpc GetVersion(VersionRequest) returns (VersionResponse) {}
   rpc RunContainer(RunContainerRequest) returns (RunContainerResponse) {}
+  rpc RunGang(RunGangRequest) returns (RunGangResponse) {}
 }
 
 message VersionRequest {}
@@ -21,6 +22,33 @@ message RunContainerRequest {
   string gpu = 6;
   string image_id = 10;
   float schedule_timeout = 12;
+}
+
+message ContainerRequestProto {
+  string container_id = 1;
+  repeated string env = 2;
+  repeated string entry_point = 3;
+  string cpu = 4;
+  string memory = 5;
+  string gpu = 6;
+  string image_id = 7;
+  uint32 gpu_count = 8;
+  string stub_id = 9;
+  string workspace_id = 10;
+}
+ 
+message RunGangRequest {
+  string group_id = 1;
+  int32 node_count = 2;
+  repeated ContainerRequestProto container_requests = 3;
+  string placement_group = 4;
+  bool enable_efa = 5;
+}
+ 
+message RunGangResponse {
+  bool success = 1;
+  string error = 2;
+  string group_id = 3;
 }
 
 message RunContainerResponse {

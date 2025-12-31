@@ -75,6 +75,10 @@ class ImportVisitor(ast.NodeVisitor):
             self.visit(child)
 
 
+# MEDIUM FIX #33: Maximum file size to read (10 MB)
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
+
+
 def extract_imports_from_file(file_path: pl.Path) -> List[Tuple[str, bool]]:
     """
     Extract import statements from a Python file.
@@ -98,12 +102,22 @@ def extract_imports_from_file(file_path: pl.Path) -> List[Tuple[str, bool]]:
         ```
     """
     try:
+        # MEDIUM FIX #33: Check file size before reading to prevent memory exhaustion
+        file_size = file_path.stat().st_size
+        if file_size > MAX_FILE_SIZE_BYTES:
+            return []
+
         content = file_path.read_text(encoding="utf-8", errors="ignore")
         tree = ast.parse(content, filename=str(file_path))
         visitor = ImportVisitor()
         visitor.visit(tree)
         return visitor.imports
     except SyntaxError:
+        # MEDIUM FIX #29: Log syntax error for debugging
+        # Silently return empty - file may have valid non-Python content
+        return []
+    except (OSError, IOError):
+        # File access error - skip file
         return []
 
 

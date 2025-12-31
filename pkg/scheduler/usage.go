@@ -40,3 +40,45 @@ func (sm *SchedulerUsageMetrics) CounterIncContainerRequested(request *types.Con
 		"gpu":          request.Gpu,
 	}, 1.0)
 }
+
+func (sm *SchedulerUsageMetrics) CounterIncClusterRequested(request *types.GangRequest) {
+	if sm.UsageRepo == nil {
+		return
+	}
+
+	var workspaceId, stubId, gpu string
+	if len(request.ContainerRequests) > 0{
+		workspaceId = request.ContainerRequests[0].WorkspaceId
+		stubId = request.ContainerRequests[0].StubId
+		gpu = request.ContainerRequests[0].Gpu
+	}
+	sm.UsageRepo.IncrementCounter(types.UsageMetricsSchedulerClusterRequested, map[string]interface{}{
+		"value": 1,
+		"workspace_id": workspaceId,
+		"stub_id": stubId,
+		"gpu": gpu,
+		"node_count": request.NodeCount,
+		"group_id": request.GroupID,
+	}, 1.0)
+}
+
+func (sm *SchedulerUsageMetrics) CounterIncClusterScheduled(request *types.GangRequest) {
+	if sm.UsageRepo == nil {
+		return
+	}
+
+	var workspaceId, stubId, gpu string
+	if len(request.ContainerRequests) > 0{
+		workspaceId = request.ContainerRequests[0].WorkspaceId
+		stubId = request.ContainerRequests[0].StubId
+		gpu = request.ContainerRequests[0].Gpu
+	}
+	sm.UsageRepo.IncrementCounter(types.UsageMetricsSchedulerClusterScheduled, map[string]interface{}{
+		"value": 1,
+		"workspace_id": workspaceId,
+		"stub_id": stubId,
+		"gpu": gpu,
+		"node_count": request.NodeCount,
+		"group_id": request.GroupID,
+	}, 1.0)
+}
